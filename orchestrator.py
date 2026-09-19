@@ -84,7 +84,7 @@ def build_abort_workorder(state: dict, error: str = "") -> dict:
         "工单编号": f"WO-{correlation_id}-ABORT",
         "风险等级": "待人工处理（诊断流程异常中断）",
         "风险说明": (
-            f"诊断流程在执行途中异常中断，未产出可用结论"
+            "诊断流程在执行途中异常中断，未产出可用结论"
             + (f"（错误类型：{error}）" if error else "")
             + "。本次未生成维修方案，请人工介入排查，"
             "切勿依据不完整信息拆机作业。"

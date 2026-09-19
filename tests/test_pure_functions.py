@@ -73,10 +73,18 @@ def test_generate_followup_question_empty_when_all_fields_present():
     assert generate_followup_question(fault_info) == ""
 
 
-def test_generate_followup_question_asks_for_optional_alarm_code():
-    # 报警代码标注为“如有”，缺失时仍会追问，但措辞应体现其为可选
+def test_generate_followup_question_alarm_code_optional_when_specific_phenomenon():
+    """设计意图：报警代码是『细化信号』之一，不强制追问。
+    当设备类型 + 具体故障现象都已给出时，不再为缺失的报警代码反复打扰用户——
+    用户没有报警代码可能就是真的没有，给他『够了就别再问』的体验。
+
+    旧版本把报警代码视为必填字段，所以这条曾经断言『追问里必须含「报警代码」』。
+    改 `is_info_sufficient` 把报警代码从『必填』降为『细化信号』后，配套：
+    充分判定放宽了，追问也得相应收敛，否则会自己打自己嘴巴。
+    """
     question = generate_followup_question({"设备类型": "数控机床", "故障现象": ["异响"]})
-    assert "报警代码" in question
+    # 设计意图：此时故障信息已具体到能诊断，不必再追问报警代码
+    assert question == ""
 
 
 # ========== extract_kb_causes：解析知识库"可能原因"条目 ==========

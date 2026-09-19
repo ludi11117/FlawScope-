@@ -11,21 +11,28 @@
 import { useEffect, useState } from 'react'
 import { DiagnosePage } from './pages/DiagnosePage'
 import { HistoryPage } from './pages/HistoryPage'
+import { StatsPage } from './pages/StatsPage'
+import { useHealth } from './hooks/useHealth'
+import { HEALTH_META, startupHint } from './api/health'
 
-type Route = 'diagnose' | 'history'
+type Route = 'diagnose' | 'history' | 'stats'
 
 const ROUTES: { key: Route; label: string; icon: string }[] = [
   { key: 'diagnose', label: '故障诊断', icon: '◈' },
   { key: 'history', label: '诊断历史', icon: '▤' },
+  { key: 'stats', label: '系统统计', icon: '◔' },
 ]
 
 function parseHash(): Route {
   const h = window.location.hash.replace(/^#\/?/, '')
-  return h === 'history' ? 'history' : 'diagnose'
+  if (h === 'history') return 'history'
+  if (h === 'stats') return 'stats'
+  return 'diagnose'
 }
 
 export function App() {
   const [route, setRoute] = useState<Route>(parseHash)
+  const health = useHealth()
 
   // 支持浏览器前进/后退：不监听的话，用户按后退键 URL 变了但页面不切
   useEffect(() => {
@@ -113,8 +120,23 @@ export function App() {
           )
         })}
 
-        {/* 运行状态点：让"后端是否活着"一眼可见 */}
-        <span
+        {/* 运行状态灯：轮询 /health/live + /health/ready，真实反映后端可用性。
+            此前这里是写死的绿点，后来改成只看 liveness——两种都会撒谎：
+            冷启动的十几秒里 liveness 已是 200，但初始化没完成，
+            此时点"开始诊断"必然失败。现在以 readiness 为准，
+            并把"正在启动"与"不可达"分开（一个该等，一个该去启动进程）。 */}
+        <button
+          type="button"
+          onClick={health.refresh}
+          data-testid="health-indicator"
+          data-health-state={health.state}
+          title={
+            health.state === 'starting'
+              ? startupHint(health.ready)
+              : health.version
+                ? `后端版本 ${health.version}，点击重新探活`
+                : '点击重新探活'
+          }
           style={{
             marginLeft: 'auto',
             display: 'flex',
@@ -122,35 +144,62 @@ export function App() {
             gap: 6,
             fontSize: 11.5,
             color: 'var(--color-text-tertiary)',
+            background: 'transparent',
+            border: 'none',
+            padding: 0,
+            cursor: 'pointer',
+            fontFamily: 'inherit',
           }}
         >
           <span
             aria-hidden
+            data-testid="health-dot"
             style={{
               width: 6,
               height: 6,
               borderRadius: '50%',
-              background: 'var(--success)',
-              boxShadow: '0 0 0 3px rgba(15, 110, 86, 0.12)',
+              background: HEALTH_META[health.state].color,
+              boxShadow: `0 0 0 3px ${HEALTH_META[health.state].halo}`,
+              transition: 'background var(--transition), box-shadow var(--transition)',
+              // 启动中让点"呼吸"，传达"有事情正在发生，不是卡住了"
+              animation: health.state === 'starting' ? 'fs-pulse-soft 1.4s ease-in-out infinite' : 'none',
             }}
           />
-          <a
-            href="/api/docs"
-            target="_blank"
-            rel="noreferrer"
-            style={{
-              color: 'var(--color-text-tertiary)',
-              textDecoration: 'none',
-              borderBottom: '1px dotted var(--color-border-secondary)',
-            }}
-          >
-            API 文档
-          </a>
-        </span>
+          <span data-testid="health-label">{HEALTH_META[health.state].label}</span>
+          {/* 启动中把后端上报的步骤一并显示——十几秒的等待没有进度反馈，
+              用户会以为页面坏了 */}
+          {health.state === 'starting' && health.ready?.step_total ? (
+            <span style={{ color: 'var(--color-text-tertiary)', opacity: 0.85 }}>
+              · {health.ready.step}
+              {health.ready.step_index ? ` ${health.ready.step_index}/${health.ready.step_total}` : ''}
+            </span>
+          ) : null}
+        </button>
+
+        <a
+          href="/api/docs"
+          target="_blank"
+          rel="noreferrer"
+          style={{
+            marginLeft: 14,
+            fontSize: 11.5,
+            color: 'var(--color-text-tertiary)',
+            textDecoration: 'none',
+            borderBottom: '1px dotted var(--color-border-secondary)',
+          }}
+        >
+          API 文档
+        </a>
       </nav>
 
       <main key={route} className="fs-rise">
-        {route === 'diagnose' ? <DiagnosePage /> : <HistoryPage />}
+        {route === 'stats' ? (
+          <StatsPage />
+        ) : route === 'history' ? (
+          <HistoryPage />
+        ) : (
+          <DiagnosePage />
+        )}
       </main>
     </div>
   )

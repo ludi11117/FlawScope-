@@ -55,21 +55,30 @@ src/
 
 ## 单元测试
 
-62 项，全部离线、不依赖后端：
+86 项，全部离线、不依赖后端：
 
 | 文件 | 项数 | 覆盖什么 |
 |---|---|---|
 | `api/sse.test.ts` | 18 | 跨 chunk 分片、多行 data、注释心跳、半截消息 |
 | `state/machine.test.ts` | 17 | 节点映射（含"不该映射"的反向用例）、状态归约 |
 | `pages/historyUtils.test.ts` | 27 | 分页夹取与 `clamped` 信号、CSV 注入防护、时间格式化 |
+| `api/health.test.ts` | 16 | 探活三态判定、失败时保留版本号、隐藏时暂停轮询 |
+| `ui/button.test.ts` | 8 | 危险按钮不能红底红字（真实 bug 的回归守卫） |
 
 两个刻意的组织决定：
 
-1. **把纯逻辑抽成独立模块**（`api/sse.ts`、`pages/historyUtils.ts`），
+1. **把纯逻辑抽成独立模块**（`api/sse.ts`、`api/health.ts`、`pages/historyUtils.ts`），
    而不是塞在组件里。组件只负责渲染，逻辑能被直接测——这不是为了凑测试数量，
    `pageWindow` 的 `clamped` 恒假 bug 就是抽出来之后才被测到的。
 2. **每个"该拦的"都配"该放的"**。比如 `nodeFromLabel` 既测"转人工→human_review"，
    也测"随便一句话→null"。只测前者的话，实现退化成"永远返回第一个节点"也能通过。
+
+**本项目没有 jsdom 与 @testing-library**，所有测试都是纯逻辑的、不渲染组件。
+这不是疏漏而是取舍：为了测一个组件而引入整套 DOM 环境，成本高于把逻辑抽出来。
+`api/health.ts` 里的 `shouldPoll(hidden)` 就是为此而生的——它本来是 hook 里的
+一个 `if (document.hidden)`，抽出来才成为可直测的布尔函数。
+**代价要如实承认**：接线是否正确（比如 `App.tsx` 有没有真的把状态灯接到
+`HEALTH_META[health.state]`）测不到，只能靠人工开页面看一次。
 
 ## 几个刻意的技术选择
 
@@ -108,8 +117,7 @@ src/
 
 ## 已知限制
 
-- 本次迁移了**诊断页与历史页**；统计页仍由 Streamlit 提供（8501）。
-  接口（`/stats`）已就绪，迁移是纯前端工作。
-- 路由是极简的 hash 路由（`#/diagnose`、`#/history`），没引 react-router。
-  两个页面不值得为它加一个依赖。
+- **诊断 / 历史 / 统计三个页面都已迁移到 React**；Streamlit 旧前端（8501）仅作对照保留。
+- 路由是极简的 hash 路由（`#/diagnose`、`#/history`、`#/stats`），没引 react-router。
+  三个页面不值得为它加一个依赖。
 - 移动端适配只做了基础响应式，未针对触屏优化。

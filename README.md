@@ -34,7 +34,11 @@
         │
         ▼
 ┌─────────────────────────────┐
-│  Streamlit 前端 (app.py)     │   诊断页 / 历史页
+│  React 前端 (web/)           │   诊断页 / 历史页 / 统计页
+└──────────┬──────────────────┘
+           │ HTTP + SSE（/api/*）
+┌──────────▼──────────────────┐
+│  api.py  FastAPI 接口层      │   鉴权 / 并发闸门 / 健康探针
 └──────────┬──────────────────┘
            │ 直接调用
 ┌──────────▼──────────────────┐
@@ -57,7 +61,8 @@
 │  data/knowledge_base.txt 原始知识
 └─────────────────────────────┘
 
-另：api.py 将 orchestrator 封装为 REST API，供外部系统调用
+另：Streamlit 旧前端（`app.py`）保留供对照，已不是日常入口；
+`api.py` 同时把 orchestrator 暴露为 REST API，供外部系统调用
 ```
 
 ---
@@ -155,7 +160,8 @@
 
 ```
 FlawScope/
-├── app.py                    Streamlit 前端（诊断页 + 历史页 + 统计页）
+├── web/                      React 前端（诊断页 / 历史页 / 统计页，Vite + TypeScript）
+├── app.py                    Streamlit 旧前端（归档对照，不再是日常入口）
 ├── api.py                    FastAPI 接口层
 ├── orchestrator.py           LangGraph 状态机（调度中心）★核心
 ├── agents.py                 各 Agent 提示词、校验、RAG、工具 ★核心
@@ -188,7 +194,7 @@ FlawScope/
 │   └── raw/                  厂家手册原件（受版权保护，已 gitignore，不入库）
 ├── chroma_db/                ChromaDB 向量库（持久化）
 ├── diagnosis_history.db      SQLite 诊断历史
-├── .streamlit/config.toml    前端配置（绑定 0.0.0.0 支持局域网访问）
+├── .streamlit/config.toml    Streamlit 旧前端配置（绑定 0.0.0.0 支持局域网访问）
 ├── .github/workflows/ci.yml  CI：ruff 静态检查 + pytest
 ├── ruff.toml                 静态检查规则（保守集合，见文件内说明）
 ├── Dockerfile / docker-compose.yml / entrypoint.sh   容器化部署
@@ -296,7 +302,7 @@ python build_knowledge_base.py
 #   → 后端 http://127.0.0.1:8000/docs
 #   → 前端 http://127.0.0.1:5173
 
-# 或分别启动
+# 或分别启动（各自开一个窗口，单独调试时用）
 启动后端.bat                # uvicorn api:app  :8000
 启动React前端.bat           # vite dev         :5173
 
@@ -304,8 +310,22 @@ python build_knowledge_base.py
 python orchestrator.py
 ```
 
+**启动过程说明**（`启动全部.bat` → `run_all.py`）：
+
+- **只有一个窗口**。两个服务作为子进程跑在同一个控制台里，日志分别加
+  `[后端]` / `[前端]` 前缀；Ctrl+C 一次停掉全部（含 npm 派生的 node 进程，
+  不会留下占着 5173 端口的孤儿进程）。
+  之前用 `start cmd /k` 会弹出三个黑窗口，且关哪个窗口都不算干净地停止。
+- **浏览器不等后端**就打开——前端端口起来就跳页面。后端还在初始化时，
+  顶栏状态灯显示"正在启动 3/5 加载向量库"，好了一键变绿。
+  这样等待是**可见的**，不用对着黑窗口猜还要多久。
+- 后端 import + 初始化约 **6~10 秒**（依赖 import 占大头）。启动器会实时显示进度。
+  > ⚠️ 若本地装了 `torch`，会凭空多出约 3 秒——`langchain_core` 顶层无条件
+  > `from transformers import ...`，而 transformers 检测到 torch 就把它 import 进来。
+  > 本项目不用本地推理，详见 `requirements.txt` 顶部注释。启动器检测到会提示卸载。
+
 > 旧的 Streamlit 前端（`启动前端.bat` / `streamlit run app.py`，:8501）已不再是
-> 日常入口——诊断页与历史页都已迁移到 React。仅在需要对照旧实现时启动。
+> 日常入口——诊断页 / 历史页 / 统计页都已迁移到 React。仅在需要对照旧实现时启动。
 
 ---
 
@@ -373,10 +393,26 @@ docker compose down
 | GET | `/records/{id}/workorder.md` | 把该条记录的工单导出为可打印的 Markdown |
 | DELETE | `/records/{id}` | 删除指定记录 |
 | GET | `/stats` | 统计信息 |
-| GET | `/health/live` | 存活探针：只确认进程在，不触碰外部依赖，毫秒级返回 |
-| GET | `/health` | 就绪探针：探活 LLM / Embedding / ChromaDB / SQLite，结果默认缓存 60s（`?fresh=true` 强制真探） |
+| GET | `/health/live` | **存活探针**：只确认进程在，不触碰外部依赖，毫秒级返回 |
+| GET | `/health/ready` | **就绪探针**：启动初始化是否完成、能否接诊断请求。未就绪返回 `503` + 进度 |
+| GET | `/health` | **依赖健康**：探活 LLM / Embedding / ChromaDB / SQLite，结果默认缓存 60s（`?fresh=true` 强制真探） |
+
+三个探针的分工是刻意区分的，混用会出问题：
+
+| 端点 | 回答什么 | 启动初始化期间 |
+|---|---|---|
+| `/health/live` | 进程要不要被重启 | **200**（进程确实活着） |
+| `/health/ready` | 请求现在能不能成功 | **503**（还没初始化完） |
+| `/health` | 依赖（LLM/向量库…）全不全 | 依赖未加载 → unhealthy |
+
+> ⚠️ **不要拿 `/health/live` 判断"能不能用"**。它在启动过程中就返回 200，
+> 而此时向量库还没加载、诊断必然失败——前端状态灯早期只看 liveness，
+> 于是冷启动那几秒显示"服务正常"，用户点下去拿到一个失败。
+> 判断可用性请用 `/health/ready`。
 
 > `/health` 会真实调用一次 LLM 与 Embedding。Docker healthcheck 每 30s 打一次，不做缓存会持续烧配额并拖慢探活；因此默认加了 TTL 缓存，容器编排的 livenessProbe 请改用 `/health/live`。
+
+> `/health/ready` **只读内存状态**，不触碰任何依赖，可以放心高频轮询（前端默认 5s，启动中 1.5s）。
 
 > **鉴权（可选）**：在 `.env` 里设置 `API_KEY` 后，上表所有业务接口（`/diagnose`、`/records*`、`/stats`）
 > 都需带 `X-API-Key` 请求头；不设置则不校验（本地开发默认）。探针 `/health*` 与 `/` 始终开放。
@@ -782,20 +818,21 @@ query 使用、经验冲突材料为何使单 Agent 必然失真）见 `docs/为
 - **真实检索排名未固化进评估**：`explain_retrieval.py` 因为要离线跑，给查询嵌入打了桩，
   排名失真。可考虑加"配真 key 时去掉桩"的分支，把真实三路排名也纳入回归对比
 - **反馈闭环**：人工审核结论可回流知识库，形成越用越准的飞轮
-- **并发与流式**：Streamlit 已有节点级进度展示；API 侧 `/diagnose` 仍是同步阻塞调用，长任务可改为任务队列 + 轮询/SSE
+- **并发与流式**：React 前端走 `/diagnose/stream`（SSE，节点级进度）；`/diagnose` 同步端点仍是阻塞调用，
+  主要留给外部系统，长任务可改为任务队列 + 轮询
 - **限流**：已有全局并发闸门（`MAX_CONCURRENT_DIAGNOSES`）与可选鉴权，但**没有按 IP / 租户的限流**，
   公网部署仍建议加 slowapi 或网关限流；闸门是全局的，一个调用方打满后其他人也会被 503
 - **深翻页**：`offset` 分页在记录量很大时仍有 `OFFSET` 扫描成本（SQLite 要跳过前 N 行）。
   历史表到十万级后可换成游标分页（`WHERE id < ?` keyset pagination）
 - **工单导出格式**：目前只导出 Markdown。现场若需打印归档，可再加 PDF / Word 渲染
-- **前端会话**：Streamlit 的多轮追问上下文存在 session_state 中，刷新页面即丢失，可持久化到 SQLite
-- **诊断过程不可中断**：Streamlit 的单次脚本执行是阻塞的，诊断进行中前端事件不会被处理，
-  因此不提供"取消诊断"按钮（此前那个按钮的显示条件写反了，只在没有诊断在跑时出现，等于无效）。
-  真要支持中断需改成"后台线程执行 + `st.fragment` 轮询"的架构
-- **前端历史页性能**：列表逐条渲染 7 个 `st.json`，记录多时会卡；可改为表格 + 按需展开详情
+- **前端会话**：多轮追问的上下文只存在前端内存中，刷新页面即丢失，可持久化到 SQLite
+- **诊断中断**：React 前端已支持中断（abort 触发后端生成器 close，不会跑完剩余节点）；
+  `/diagnose` 同步端点仍不可中断
+- **前端历史页性能**：React 版已从"逐条渲染 JSON"改为紧凑表格 + 按需展开详情；
+  Streamlit 旧版仍保留原实现
 - **知识库健康检查**：启动时若 `chroma_db/` 为空只会在首次检索时告警，可在启动阶段就显式提示"请先执行 build_knowledge_base.py"
 - **依赖锁定**：`requirements.txt` 只固定直接依赖，传递依赖未锁；建议用 `uv lock` / `pip-compile` 生成带 hash 的锁文件
-- **Streamlit 前端鉴权**：`API_KEY` 只保护 API，前端需反向代理认证（详见 `.streamlit/config.toml` 内的说明）
+- **前端鉴权**：`API_KEY` 只保护 API；React 前端自身无鉴权，公网部署需反向代理认证
 
 ---
 

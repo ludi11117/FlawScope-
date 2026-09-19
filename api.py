@@ -5,7 +5,7 @@ import time
 import uuid
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
@@ -19,6 +19,7 @@ from agents import get_db as get_chroma_db, get_llm, get_embeddings
 from config import settings
 from logging_config import get_logger, configure_logging
 from workorder_export import workorder_to_markdown, workorder_filename
+from startup_status import set_step, mark_ready, mark_failed, snapshot as startup_snapshot
 
 logger = get_logger(__name__)
 
@@ -52,14 +53,36 @@ def require_api_key(x_api_key: str = Header(default="")):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
-    # 启动时初始化
-    configure_logging()
-    init_db()
-    # 预热单例
-    get_llm()
-    get_embeddings()
-    get_chroma_db()
+    """应用生命周期管理。
+
+    启动阶段逐步上报进度（见 `startup_status`）。这不是装饰：初始化要花十几秒，
+    其中 `import` 链就占了大头（torch 被 langchain_core 无条件拖进来），
+    而这期间 `/health/live` 已经返回 200 了。前端状态灯若只看 liveness，
+    会在这十几秒里显示"服务正常"——用户据此点下"开始诊断"必然失败。
+    """
+    steps = [
+        ("加载日志配置", configure_logging),
+        ("初始化数据库", init_db),
+        # 这三步是真正的耗时项：向量库要读盘，BM25 要全库分词
+        ("加载模型客户端", get_llm),
+        ("加载嵌入模型", get_embeddings),
+        ("加载向量库", get_chroma_db),
+    ]
+    total = len(steps)
+
+    try:
+        for i, (label, fn) in enumerate(steps, start=1):
+            set_step(label, i, total)
+            logger.info("startup_step", step=label, index=i, total=total)
+            fn()
+    except Exception as e:
+        # 启动失败必须显式记录并向上抛：半初始化的服务对外宣告"就绪"比崩溃更危险，
+        # 因为它会让调用方以为请求失败是自己的问题。
+        mark_failed(f"{type(e).__name__}: {e}")
+        logger.error("startup_failed", error=str(e))
+        raise
+
+    mark_ready()
     logger.info("api_startup_complete")
     yield
     # 关闭时清理
@@ -374,8 +397,43 @@ def stats(_: None = Depends(require_api_key)):
 @app.get("/health/live")
 def health_live():
     """存活探针：只确认进程还在，不触碰任何外部依赖，毫秒级返回。
-    编排层的 livenessProbe 应该用这个，避免把"上游抖动"误判成"进程该重启"。"""
+    编排层的 livenessProbe 应该用这个，避免把"上游抖动"误判成"进程该重启"。
+
+    ⚠️ **它在启动过程中也会立刻返回 200**（进程确实活着），
+    所以**不能**用它判断"能不能开始诊断"——那要问 `/health/ready`。
+    """
     return {"status": "alive", "version": API_VERSION}
+
+
+@app.get("/health/ready")
+def health_ready():
+    """就绪探针：启动初始化是否已完成，可否承接诊断请求。
+
+    与 `/health/live` 的分工是刻意区分的：
+      - liveness（/health/live）回答"进程要不要被重启" → 启动期间就该是 200
+      - readiness（这里）回答"请求现在能不能成功" → 初始化完成前必须是 503
+
+    两者混用是部署里很常见的一类错误：把 liveness 当成"可用"来用，
+    就会在冷启动窗口内对外宣告可用，把初始化耗时转嫁成用户的第一次失败。
+
+    不探 LLM / Embedding / ChromaDB（那是 `/health` 的职责，会真烧配额），
+    这里只读一个内存里的状态标志，毫秒级返回，可以放心高频轮询。
+    """
+    st = startup_snapshot()
+    payload = {
+        "ready": st["ready"],
+        "step": st["step"],
+        "step_index": st["step_index"],
+        "step_total": st["step_total"],
+        "elapsed_ms": st["elapsed_ms"],
+        "error": st["error"],
+        "version": API_VERSION,
+    }
+    if not st["ready"]:
+        # 503 而不是 200 + ready:false：部署脚本/负载均衡大多只看状态码，
+        # 用状态码表达"还不能接活"才不会被忽略。同时保留 body 供前端显示进度。
+        return JSONResponse(status_code=503, content=payload)
+    return payload
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -471,5 +529,9 @@ def root():
         "name": "FlawScope API",
         "version": API_VERSION,
         "docs": "/docs",
-        "health": "/health"
+        # 三个探针的分工写在这里，避免调用方挑错端点：
+        # live = 进程活着；ready = 能接诊断请求；health = 依赖全健康（会烧配额）
+        "health": "/health",
+        "health_live": "/health/live",
+        "health_ready": "/health/ready"
     }

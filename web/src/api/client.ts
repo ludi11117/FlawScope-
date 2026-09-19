@@ -13,6 +13,7 @@ import type {
   DiagnosisRecord,
   Stats,
 } from '../types/contracts'
+import type { HealthPayload, ReadyPayload } from './health'
 import { splitSSEBuffer, parseSSEBlock } from './sse'
 
 const BASE = '/api'
@@ -99,6 +100,47 @@ export function deleteRecord(id: number): Promise<{ message: string }> {
 
 export function getStats(): Promise<Stats> {
   return request<Stats>('/stats')
+}
+
+/**
+ * 存活探针：只确认后端进程还在，不触碰任何外部依赖，毫秒级返回。
+ *
+ * ⚠️ **它不能用来判断"能不能开始诊断"**：启动初始化期间它同样是 200。
+ * 判断可用性要用 `getHealthReady()`。
+ *
+ * 顶栏状态灯用它做"进程还在吗"的兜底。**不要换成 `/health`**——那个会真去探
+ * LLM / Embedding / ChromaDB，每 5 秒调一次等于持续烧配额。
+ */
+export function getHealthLive(): Promise<HealthPayload> {
+  return request<HealthPayload>('/health/live')
+}
+
+/**
+ * 就绪探针：初始化是否完成、可以承接诊断请求。
+ *
+ * 与 `getHealthLive()` 的分工见 `api/health.ts` 的模块注释。
+ * 这里**不用 `request()`**：未就绪时后端返回 503，而 `request()` 会把非 2xx
+ * 一律抛成 ApiError，于是"正在启动"这个正常状态会被当成异常。
+ * 我们要的是原始状态码 + body，所以直接 fetch。
+ *
+ * 返回 `null` 表示网络层失败（后端根本没起）。
+ */
+export async function getHealthReady(): Promise<{
+  status: number
+  body: ReadyPayload | null
+} | null> {
+  try {
+    const resp = await fetch(`${BASE}/health/ready`, { headers: authHeaders() })
+    let body: ReadyPayload | null = null
+    try {
+      body = (await resp.json()) as ReadyPayload
+    } catch {
+      // body 不是 JSON（例如 nginx 返回了 HTML 错误页），保留 null
+    }
+    return { status: resp.status, body }
+  } catch {
+    return null
+  }
 }
 
 /** 工单 Markdown 的下载地址（由浏览器直接打开，不走 fetch）。 */

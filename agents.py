@@ -1530,38 +1530,126 @@ def evaluate_semantic(diagnosis_text: str, expected_text: str, correlation_id: s
 
 # ========== 多轮追问 ==========
 
-def is_info_sufficient(fault_info: dict) -> bool:
+# 单条故障现象若不带任何「细化信号」，视为粗粒度。判定逻辑集中在这里，
+# 而不是塞进正则，避免规则只对一半 corner case 生效、看起来像跑通了。
+# 信号词覆盖：部件名、工况/时间、声、温度、位置、报警/代码。
+_PHENOMENON_DETAIL_SIGNALS = (
+    # 部件 / 部位
+    "轴", "电机", "轴承", "齿轮", "阀", "泵", "传感器", "冷却", "液压",
+    "气动", "伺服", "滚珠", "导轨", "活塞", "缸", "编码器", "控制器",
+    "机身", "床身", "主轴", "变速箱", "刀塔", "料盘", "变频器",
+    # 声音（注意：不用「响」「声」——这两个字单独出现通常是形容词，
+    # 「空压机响」「机身有声音」就是单字形容词 + 名词的粗描述；
+    # 真正细化的声音信号得是术语：异响、噪音、噪声，或模拟声字）
+    "异响", "噪音", "噪声",
+    "咣", "嗡", "嘎", "吱", "啸", "嘶", "咔", "嗒", "嘭", "咯噔",
+    # 时间 / 工况
+    "启动", "开机", "关机", "运行", "停机", "加工", "空跑", "空载",
+    "带载", "突然", "一直", "每次", "逐渐", "连续", "间歇",
+    # 报警 / 故障码
+    "报警", "代码", "ALM", "ERR", "E-", "F-", "AL.", "ER.",
+    # 程度 / 频率
+    "严重", "明显", "加剧", "加重", "反复", "时轻时重",
+    # 温度 / 外观
+    "过热", "发烫", "冒烟", "烫", "锈", "漏油", "漏气", "堵塞",
+)
+
+# 信息不足的三种情形。统一在此判定，被 is_info_sufficient（接口层）
+# 和 generate_followup_question（文案层）共用，防止两边对"什么算充分"
+# 各说各话——踩过：max-content 改过阈值但 UI 还按旧文案走。
+_INSUFFICIENT_NO_DEVICE = "no_device"
+_INSUFFICIENT_NO_SYMPTOMS = "no_symptoms"
+_INSUFFICIENT_VAGUE_SYMPTOMS = "vague_symptoms"
+
+
+def _phenomenon_too_vague(symptoms) -> bool:
+    """判定故障现象是否过于粗粒度、不足以支撑诊断。
+
+    规则：现象只有 1 项且不含任何细化信号 → 视为过粗（True）。
+    现象 ≥ 2 项或单条但含细化信号 → 不算过粗（False）。
+
+    为什么不允许多粗的并存也不算粗：实际场景里，分多条陈述本身
+    就说明用户掌握了不同维度的信号；硬要把"震"+"响"也判成信息不足
+    会逼正常用户重写，对"新学徒"没有帮助、对老用户徒增打扰。
+    """
+    if not symptoms:
+        return True
+    if len(symptoms) >= 2:
+        return False
+    p = (symptoms[0] or "").lower()
+    return not any(s.lower() in p for s in _PHENOMENON_DETAIL_SIGNALS)
+
+
+def _insufficiency_reason(fault_info: dict) -> Optional[str]:
+    """返回当前 fault_info 不充分的具体原因；充分则返回 None。
+
+    优先级：
+      1) 有报警代码 → 视为充分（报警号本身是强诊断信号）
+      2) 缺设备类型 → no_device
+      3) 有设备但无现象 → no_symptoms
+      4) 现象过粗（无细化信号）→ vague_symptoms
+    """
     device = (fault_info.get("设备类型") or "").strip()
     symptoms = fault_info.get("故障现象") or []
     alarm = (fault_info.get("报警代码") or "").strip()
+
     if alarm and alarm.lower() not in ("null", "none", ""):
-        return True
-    if device and symptoms:
-        return True
-    return False
+        return None
+
+    if not device or device.lower() in ("null", "none"):
+        return _INSUFFICIENT_NO_DEVICE
+
+    if not symptoms:
+        return _INSUFFICIENT_NO_SYMPTOMS
+
+    if _phenomenon_too_vague(symptoms):
+        return _INSUFFICIENT_VAGUE_SYMPTOMS
+
+    return None
+
+
+def is_info_sufficient(fault_info: dict) -> bool:
+    """判定结构化故障描述是否足以开始诊断。
+
+    充分性口径与 _insufficiency_reason 一致——前者只对外暴露 True/False，
+    后者把"为什么不足"也告诉追问生成器。共用底层判定，两边不会漂移。
+    """
+    return _insufficiency_reason(fault_info) is None
 
 
 def generate_followup_question(fault_info: dict) -> str:
-    missing = []
-    device = (fault_info.get("设备类型") or "").strip()
-    symptoms = fault_info.get("故障现象") or []
-    alarm = (fault_info.get("报警代码") or "").strip()
+    """根据不充分的原因，生成贴近场景的追问。
 
-    if not device or device.lower() in ("null", "none"):
-        missing.append("设备类型")
-    if not symptoms:
-        missing.append("故障现象")
-    if not alarm or alarm.lower() in ("null", "none"):
-        missing.append("报警代码（如有）")
-
-    if not missing:
+    设计上故意避开"请补充故障现象"这种空话——新学徒看到只会愣住；
+    引导式问题清单（部件/工况/异响/温度/使用时长）告诉他"可以补充什么"，
+    才能把口语化描述推进到可检索的细化信息。
+    """
+    reason = _insufficiency_reason(fault_info)
+    if reason is None:
         return ""
 
-    if len(missing) == 1:
-        return f"请补充{missing[0]}，以便我更准确地诊断。"
-    if "报警代码" in missing:
-        return f"请补充{'和'.join(missing[:-1])}，如果有的话也请提供报警代码。"
-    return f"请补充{'和'.join(missing)}。"
+    if reason == _INSUFFICIENT_NO_DEVICE:
+        return (
+            "信息还不太够，麻烦补充两点：\n"
+            "1) 设备类型——比如「数控机床主轴电机」「螺杆空压机」「液压泵站」之类；\n"
+            "2) 故障现象——比如什么时候发生、什么部位出问题、有什么异样"
+            "（声音 / 温度 / 震动 / 动作异常）。"
+        )
+
+    if reason == _INSUFFICIENT_NO_SYMPTOMS:
+        return (
+            "请用一两句话描述一下故障现象——比如什么时候发生、"
+            "是哪个部位出问题、有什么异样（声音 / 温度 / 震动 / 动作异常）。"
+        )
+
+    # reason == vague_symptoms：这是用户截图里那种"数控床一震一颤的"场景。
+    return (
+        "信息还不太够判断。麻烦再补充几点细节：\n"
+        "1) 是哪个部件 / 部位在出问题？（比如主轴、某根轴、电机、液压泵、控制器…）\n"
+        "2) 什么时候出现？（开机 / 运行 / 加工 / 停机 时？一直还是间歇？突然还是慢慢出现？）\n"
+        "3) 有没有伴随异响、异常温度、烟雾或报警代码？\n"
+        "4) 这台设备用了多久、最近一次保养是什么时候？"
+    )
 
 
 # ========== 多模态 ==========

@@ -1,5 +1,6 @@
 import sqlite3
 import json
+import os
 import threading
 from datetime import datetime
 from contextlib import contextmanager
@@ -319,9 +320,19 @@ def get_stats():
         cursor.execute("SELECT COALESCE(SUM(total_tokens), 0) FROM diagnosis_records")
         total_tokens = cursor.fetchone()[0] or 0
 
+    # 数据库文件大小。原本是 Streamlit 统计页在前端 `Path(DB_PATH).stat()` 读的，
+    # 迁到 React 之后前端拿不到 DB 路径（也不该知道），所以由这里一并返回。
+    # 读不到就给 0 而不是抛异常：这只是个展示用的次要指标，
+    # 不该因为 stat 失败把整个统计接口打挂。
+    try:
+        db_size_bytes = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    except OSError:
+        db_size_bytes = 0
+
     return {
         "total_records": total,
         "by_status": by_status,
         "avg_debate_rounds": round(avg_debate, 1),
         "total_tokens": total_tokens,
+        "db_size_bytes": db_size_bytes,
     }

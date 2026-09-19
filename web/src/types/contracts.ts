@@ -213,11 +213,28 @@ export interface DiagnosisRecord {
   total_tokens?: number
 }
 
-/** 契约来源：database.get_stats() */
+/**
+ * 契约来源：database.py :: get_stats()
+ *
+ * ⚠️ 此处曾长期与实际返回**不一致**——旧版写的是 `total` / `已解决` /
+ * `需人工复核` / `平均Token`，是照着 Streamlit 统计页的猜想写的，
+ * 而 `get_stats()` 实际返回的是 `total_records` / `by_status` /
+ * `avg_debate_rounds` / `total_tokens`，四个字段名全对不上。
+ * 由于 `getStats()` 当时没有任何调用点，这个错一直没暴露（类型检查也查不出
+ * ——它只查声明内部是否自洽，不查后端到底返回什么）。
+ * 接统计页时以 `database.py :: get_stats()` 的 `return` 字面量为准。
+ */
 export interface Stats {
-  total: number
-  已解决?: number
-  需人工复核?: number
-  平均Token?: number
-  [key: string]: unknown
+  total_records: number
+  /** 状态 → 条数。键是状态机的跨层契约值（done / llm_failed / …）。 */
+  by_status: Record<string, number>
+  /** 仅统计 debate_round > 0 的记录，空表时为 0。 */
+  avg_debate_rounds: number
+  total_tokens: number
+  /**
+   * 数据库文件字节数。由后端顺带返回（前端不该知道 DB 路径）。
+   * 早期后端没有这个字段，读不到时按缺失处理而不是当 0——
+   * "0 字节"和"没统计到"是两回事，界面上不能显示成 0 KB。
+   */
+  db_size_bytes?: number
 }

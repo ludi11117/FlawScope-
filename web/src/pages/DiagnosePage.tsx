@@ -8,9 +8,11 @@
 
 import { useCallback, useRef, useState } from 'react'
 import { useDiagnosisStream } from '../hooks/useDiagnosisStream'
+import { useHealth } from '../hooks/useHealth'
 import { StateMachineView } from '../components/StateMachineView'
 import { ResultView } from '../components/ResultView'
 import { workorderUrl } from '../api/client'
+import { startupHint } from '../api/health'
 import { btnStyle } from '../ui/button'
 
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024
@@ -37,10 +39,21 @@ const SAMPLES: { label: string; text: string }[] = [
 
 export function DiagnosePage() {
   const { state, start, abort, reset, buildContext } = useDiagnosisStream()
+  // 这里用的是与顶栏**同一个 hook 的独立实例**：组件各持一份状态，
+  // 但两者探的是同一个端点、间隔规则一致，不会出现"顶栏说好了、按钮还灰着"。
+  // 没有提到 App 用 context 下发，是因为只有两个消费点，
+  // 引入 context 的复杂度大于收益。
+  const health = useHealth()
   const [input, setInput] = useState('')
   const [imagePreview, setImagePreview] = useState<string | null>(null)
   const [imageBase64, setImageBase64] = useState<string>('')
   const fileRef = useRef<HTMLInputElement>(null)
+
+  // 后端未就绪时不允许发起诊断。否则会白等十几秒再拿到一个失败，
+  // 而失败原因（服务还没起来）用户从错误信息里读不出来。
+  const notReady = health.state === 'starting'
+  const backendDown = health.state === 'down'
+  const blocked = notReady || backendDown
 
   const onPickImage = useCallback(async (file: File | undefined) => {
     if (!file) return
@@ -58,12 +71,13 @@ export function DiagnosePage() {
   const onSubmit = useCallback(() => {
     const text = input.trim()
     if (!text) return
+    if (blocked) return
     // 多轮追问时把历史上下文拼进去，与 Streamlit 版行为一致。
     // 后端每次请求都是无状态的，上下文只能由前端累积。
     const ctx = buildContext()
     const payload = ctx ? `${ctx}\n\n【本轮补充】${text}` : text
     start(payload, imageBase64)
-  }, [input, imageBase64, start, buildContext])
+  }, [input, imageBase64, start, buildContext, blocked])
 
   const workorderRecordId = state.result?.record_id ?? null
   const showWorkorderHint =
@@ -103,6 +117,40 @@ export function DiagnosePage() {
           用自然语言描述故障，系统自动完成检索、诊断、审核与工单生成；资料不足时会明确说明而不是编造。
         </p>
       </header>
+
+      {/* 后端未就绪提示。放在输入区之前，用户第一眼就能看到"现在还不能用、为什么"，
+          而不是输完一大段话、点了按钮才失败。
+          用 accent 蓝而不是警示色：启动是正常过程，不是出错。 */}
+      {blocked && (
+        <div
+          className="fs-banner fs-rise"
+          style={{
+            padding: '11px 14px',
+            borderRadius: 'var(--radius-md)',
+            background: backendDown ? 'var(--danger-soft)' : 'var(--accent-soft)',
+            border: `0.5px solid ${backendDown ? 'var(--danger)' : 'var(--accent-border)'}`,
+            color: backendDown ? '#791F1F' : '#2E2A5E',
+            fontSize: 13,
+            lineHeight: 1.6,
+            marginBottom: 16,
+          }}
+        >
+          {backendDown ? (
+            <>
+              <b>后端服务不可达。</b>
+              请确认已运行「启动后端.bat」或「启动全部.bat」，然后点顶栏状态灯重新探活。
+            </>
+          ) : (
+            <>
+              <b>后端正在启动，请稍候。</b>
+              初始化要加载向量库与检索索引，约十几秒。{startupHint(health.ready)}
+              <div style={{ marginTop: 3, opacity: 0.85 }}>
+                加载完成后本提示会自动消失，无需刷新页面。
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       {/* 输入区 */}
       <div
@@ -240,8 +288,13 @@ export function DiagnosePage() {
               中断诊断
             </button>
           ) : (
-            <button onClick={onSubmit} disabled={!input.trim()} style={btnStyle(true, !input.trim())}>
-              开始诊断
+            <button
+              onClick={onSubmit}
+              disabled={!input.trim() || blocked}
+              style={btnStyle(true, !input.trim() || blocked)}
+              title={blocked ? '后端尚未就绪' : undefined}
+            >
+              {notReady ? '后端启动中…' : backendDown ? '后端不可达' : '开始诊断'}
             </button>
           )}
 

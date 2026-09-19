@@ -135,6 +135,20 @@ button {
   }
 }
 
+/* 顶栏"正在启动"状态灯的呼吸：用主色，传达"有事情在发生"而不是"出问题了"。
+   与上面那个用 box-shadow 不同，这个不能覆盖 box-shadow——
+   状态灯的光晕是用内联 box-shadow 画的，动画覆盖它会闪掉光晕。
+   所以改动画透明度。 */
+@keyframes fs-pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
 /* 数字滚动/切换时的轻微高亮 */
 @keyframes fs-flash {
   0% {

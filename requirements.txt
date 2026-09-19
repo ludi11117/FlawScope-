@@ -2,6 +2,28 @@
 # 版本与本地实测环境一致；Docker 使用 requirements-runtime.txt（同版本，去掉开发依赖）
 # 说明：向量库统一使用官方独立包 langchain-chroma，
 #       已弃用的 langchain-community 不再依赖。
+#
+# ⚠️ 不要安装 torch / torchvision / sentence-transformers（本项目不需要）
+# ---------------------------------------------------------------------------
+# 本项目**不用本地推理**：推理走 SiliconFlow 在线 API，嵌入走在线 Embedding API，
+# 向量检索用 ChromaDB + BM25。所以本地既不需要 torch，也不需要 sentence-transformers。
+#
+# 但装了它们会**无声地拖慢启动**，原因是传递依赖：
+#   langchain_core/language_models/base.py 顶层无条件执行
+#       from transformers import GPT2TokenizerFast
+#   → transformers/__init__.py 导入 modeling_gguf_pytorch_utils
+#   → 该模块检测到 torch 可用就 `import torch`
+# 于是 import 链里凭空多出 torch（约 2.5s）+ torchvision，冷启动从 ~6s 涨到 ~9s。
+#
+# 实测（本机，import api 耗时中位数）：装了 torch 约 9.3s，卸掉后约 5.7s。
+# 影响的不只是启动：pytest 全量从 ~59s 降到 ~21s。
+#
+# transformers 本身**保留**（它不依赖 torch 的部分仍在被 langchain_core 用于
+# token 估算，且 fast tokenizer 走 tokenizers 库，不需要 torch）。
+#
+# 自查：python -c "import importlib.util as u; print(u.find_spec('torch'))"
+#       打印 None 即为正常；非 None 说明有包把它带进来了。
+# 恢复（若确需本地推理）：pip install torch torchvision
 
 # ===== LLM / Agent 编排 =====
 langchain-openai==1.5.1

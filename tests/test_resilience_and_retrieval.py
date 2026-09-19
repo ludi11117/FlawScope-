@@ -344,6 +344,49 @@ def test_get_stats_tolerates_corrupt_token_json(temp_db):
     assert temp_db.get_stats()["total_tokens"] == 0
 
 
+def test_get_stats_reports_db_size_bytes(temp_db):
+    """数据库大小由后端一并返回。
+
+    为什么要后端给：Streamlit 统计页原本在前端 `Path(settings.DB_PATH).stat()` 读文件，
+    迁到 React 之后前端拿不到（也不该知道）DB 路径，所以挪到 get_stats()。
+
+    断言"大于 0"而不是写死字节数：临时库里刚存过记录，
+    文件必然非空；写死具体大小会在 SQLite 版本变化时无谓地红。
+    """
+    temp_db.save_diagnosis_record("A", {"status": "done"}, {})
+
+    size = temp_db.get_stats()["db_size_bytes"]
+    assert isinstance(size, int)
+    assert size > 0
+
+
+def test_get_stats_db_size_never_breaks_other_metrics(temp_db, monkeypatch):
+    """读文件大小失败时不能拖垮整个统计接口。
+
+    判别式：若实现裸写 `os.path.getsize(DB_PATH)` 且不做兜底，
+    一次 OSError（文件被占用、权限、路径异常）会让**整个 /stats 挂掉**，
+    而统计页上真正重要的三个指标一个都显示不出来。
+    次要指标绝不能拖垮主要指标。
+
+    注意不能靠改 `DB_PATH` 来模拟——那会让 `init_db()` 先连不上库，
+    测到的就不是文件大小这条路径了。
+    """
+    import os
+
+    temp_db.save_diagnosis_record("A", {"status": "done"}, {})
+
+    def boom(_path):
+        raise OSError("模拟 stat 失败")
+
+    monkeypatch.setattr(os.path, "getsize", boom)
+
+    stats = temp_db.get_stats()
+    assert stats["db_size_bytes"] == 0
+    # 关键：其余指标必须照常返回
+    assert stats["total_records"] == 1
+    assert stats["by_status"] == {"done": 1}
+
+
 def test_delete_record(temp_db):
     temp_db.save_diagnosis_record("A", {"status": "done"}, {})
     record_id = temp_db.get_records()[0]["id"]

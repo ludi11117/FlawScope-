@@ -1,43 +1,50 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+title FlawScope
 
-echo ============================================================
-echo   FlawScope 一键启动（后端 + React 前端）
-echo ------------------------------------------------------------
-echo   后端 API   http://127.0.0.1:8000   （接口文档 /docs）
-echo   前端页面   http://127.0.0.1:5173
-echo ------------------------------------------------------------
-echo   关闭本窗口即同时停止两个服务。
-echo ============================================================
-echo.
+echo Preparing to start, please wait...
+
+REM ============================================================
+REM  FlawScope one-click launcher (single window)
+REM
+REM  All real logic lives in run_all.py; this file only locates
+REM  the Python interpreter and hands over.
+REM
+REM  IMPORTANT: keep this file ASCII-only and CRLF-terminated.
+REM    - Multi-byte chars here break cmd.exe parsing after chcp 65001.
+REM    - LF-only line endings break the parenthesized if-blocks below.
+REM    Both failures look like "double-clicked and nothing happened".
+REM ============================================================
 
 if not exist "venv\Scripts\python.exe" (
-    echo [错误] 找不到 venv\Scripts\python.exe
-    echo        请先在项目目录执行：python -m venv venv
+    echo.
+    echo [ERROR] venv\Scripts\python.exe not found.
+    echo         Create it first:  python -m venv venv
+    echo         Then install deps: venv\Scripts\pip install -r requirements.txt
+    echo.
     pause
     exit /b 1
 )
 
-if not exist "web\node_modules" (
-    echo [提示] 前端依赖未安装，首次启动需要几分钟...
-    pushd web
-    call npm install
-    popd
+if not exist "run_all.py" (
+    echo.
+    echo [ERROR] run_all.py not found in this directory.
+    echo         Keep this .bat and run_all.py in the same folder.
+    echo.
+    pause
+    exit /b 1
 )
 
-echo [1/2] 启动后端 API（端口 8000）...
-start "FlawScope 后端" cmd /k ""%~dp0venv\Scripts\python.exe" -m uvicorn api:app --host 127.0.0.1 --port 8000"
+echo.
+"venv\Scripts\python.exe" "run_all.py"
+set EXITCODE=%ERRORLEVEL%
 
-echo [2/2] 启动 React 前端（端口 5173）...
-start "FlawScope 前端" cmd /k "cd /d "%~dp0web" && npm run dev"
+if not "%EXITCODE%"=="0" (
+    echo.
+    echo [NOTE] Launcher exited with code %EXITCODE%. See messages above.
+)
 
 echo.
-echo 两个服务已在独立窗口启动：
-echo   - FlawScope 后端   （关闭它 = 停止 API）
-echo   - FlawScope 前端   （关闭它 = 停止页面）
-echo.
-echo 后端初始化需要十几秒（加载向量库），稍等片刻再访问：
-echo   http://127.0.0.1:5173
-echo.
-pause
+echo Press any key to close this window...
+pause >nul
