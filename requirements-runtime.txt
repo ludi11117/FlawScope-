@@ -1,4 +1,5 @@
-# Docker 运行时依赖（与 requirements.txt 同版本，去掉开发/测试依赖）
+# Docker 运行时依赖：在 requirements.txt 基础上再去掉开发/测试依赖，
+# 以及只服务于旧前端（app.py）的 streamlit / pandas。
 # 不使用本地 torch / transformers：嵌入与推理均走在线 API，镜像更小。
 
 # ===== LLM / Agent 编排 =====
@@ -26,9 +27,10 @@ jinja2==3.1.6
 jieba==0.42.1
 
 # ===== Web / 前端 =====
+# 注意：这里**不装** streamlit 与 pandas。
+# 它们只被 app.py（Streamlit 旧前端）使用，而容器入口只起 FastAPI（见 entrypoint.sh）。
+# 旧前端仍保留在仓库里供对照，需要跑它时用 requirements.txt 本地起。
 fastapi==0.141.1
 uvicorn==0.52.4
-streamlit==1.62.0
-pandas==3.0.5
 python-multipart==0.0.32
 httpx==0.28.1

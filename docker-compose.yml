@@ -17,7 +17,6 @@ services:
       - CORS_ALLOW_ORIGINS=["http://localhost:5173","http://localhost:8080"]
     ports:
       - "8000:8000"   # FastAPI（前端反代与直连调试）
-      - "8501:8501"   # Streamlit（历史页与统计页暂留）
     volumes:
       - ./chroma_db:/app/chroma_db   # 向量库（需先在宿主机执行 build_knowledge_base.py）
       - ./data:/app/data             # 知识库原文 + SQLite 诊断历史

@@ -132,16 +132,13 @@ class Settings(BaseSettings):
             "http://127.0.0.1:8501",
         ],
         description=(
-            "允许跨域的前端来源。5173 是 Vite 开发服务器，8501 是保留的 Streamlit 前端。"
+            "允许跨域的前端来源。5173 是 Vite 开发服务器（当前唯一前端）；"
+            "8501 仅为本地起 Streamlit 旧前端做对照时保留，容器不再暴露该端口。"
             "刻意不用 ['*']：带凭据的请求下通配符会被浏览器拒绝，"
             "生产环境放开任意源则等于把 API 暴露给任何网站。"
             "公网部署时把实际前端域名追加进来"
         )
     )
-
-    # Streamlit
-    STREAMLIT_PORT: int = Field(default=8501)
-    STREAMLIT_ADDRESS: str = Field(default="0.0.0.0")
 
     # 用 SettingsConfigDict 而不是 `class Config`：后者在 Pydantic v2 里已废弃
     # （每次导入都会打一条 PydanticDeprecatedSince20），v3 会直接移除。

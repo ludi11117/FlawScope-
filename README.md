@@ -61,7 +61,8 @@
 │  data/knowledge_base.txt 原始知识
 └─────────────────────────────┘
 
-另：Streamlit 旧前端（`app.py`）保留供对照，已不是日常入口；
+另：Streamlit 旧前端（`app.py`）保留在仓库里供对照，但已不是日常入口——
+容器入口（`entrypoint.sh`）与运行时依赖（`requirements-runtime.txt`）都不再涉及它；
 `api.py` 同时把 orchestrator 暴露为 REST API，供外部系统调用
 ```
 
@@ -161,7 +162,7 @@
 ```
 FlawScope/
 ├── web/                      React 前端（诊断页 / 历史页 / 统计页，Vite + TypeScript）
-├── app.py                    Streamlit 旧前端（归档对照，不再是日常入口）
+├── app.py                    Streamlit 旧前端（归档对照，不再是日常入口，容器也不启动它）
 ├── api.py                    FastAPI 接口层
 ├── orchestrator.py           LangGraph 状态机（调度中心）★核心
 ├── agents.py                 各 Agent 提示词、校验、RAG、工具 ★核心
@@ -324,8 +325,10 @@ python orchestrator.py
   > `from transformers import ...`，而 transformers 检测到 torch 就把它 import 进来。
   > 本项目不用本地推理，详见 `requirements.txt` 顶部注释。启动器检测到会提示卸载。
 
-> 旧的 Streamlit 前端（`启动前端.bat` / `streamlit run app.py`，:8501）已不再是
-> 日常入口——诊断页 / 历史页 / 统计页都已迁移到 React。仅在需要对照旧实现时启动。
+> 旧的 Streamlit 前端（`streamlit run app.py`，:8501）已不再是日常入口——
+> 诊断页 / 历史页 / 统计页都已迁移到 React。仅在需要对照旧实现时本地启动。
+> **容器不再启动它**：`entrypoint.sh` 只起 FastAPI，`requirements-runtime.txt`
+> 也已不含 `streamlit` / `pandas`。要用旧前端请用 `requirements.txt` 本地跑。
 
 ---
 
@@ -358,7 +361,7 @@ New-NetFirewallRule -DisplayName "FlawScope 后端 8000" -Direction Inbound -Loc
 > 注意：Docker 只是"打包"，本地跑 Docker 仍是本机访问。要让别人访问需部署到有公网 IP 的服务器。
 
 ```bash
-# 构建并启动（前端 8501 + API 8000）
+# 构建并启动（React 前端 8080 + API 8000）
 docker compose up -d --build
 
 # 查看状态 / 日志
@@ -374,7 +377,10 @@ docker compose down
 
 **设计要点：**
 
-- **镜像瘦身**：`requirements-runtime.txt` 去掉 torch / transformers（本项目用在线 API，不需要），镜像体积大幅减小
+- **镜像瘦身**：`requirements-runtime.txt` 去掉 torch / transformers（本项目用在线 API，不需要），
+  也去掉只服务于旧前端的 `streamlit` / `pandas`，镜像体积大幅减小
+- **只暴露一个端口**：容器内只有 FastAPI（8000）。React 静态产物由 `web` 服务的 nginx 托管在 8080，
+  经 `/api` 反代到 `flawscope:8000`；旧前端的 8501 不再开放
 - **数据持久化**：挂载 `chroma_db/` 与 `data/` 两个**目录**，容器重建数据不丢。
   SQLite 落在 `data/diagnosis_history.db`（由 `DB_PATH` 指定），刻意**不单独挂载 `.db` 文件**：
   宿主机上该文件不存在时 Docker 会创建同名**目录**导致 SQLite 打不开，且 WAL 的 `-wal`/`-shm`
@@ -416,7 +422,7 @@ docker compose down
 
 > **鉴权（可选）**：在 `.env` 里设置 `API_KEY` 后，上表所有业务接口（`/diagnose`、`/records*`、`/stats`）
 > 都需带 `X-API-Key` 请求头；不设置则不校验（本地开发默认）。探针 `/health*` 与 `/` 始终开放。
-> ⚠️ 它**保护不了 Streamlit 前端**（8501 是另一个进程），前端要另行加反向代理认证。
+> ⚠️ 它**保护不了前端**：React 静态站（nginx :8080）是另一个进程，公网部署要另行加反向代理认证。
 
 > **输入上限**：`/records` 的 `limit` 上限 500、`offset` 必须 ≥ 0；`fault_description` 上限 4000 字符；
 > `image_base64` 有长度上限（默认约 6MB 原图，见 `MAX_IMAGE_BASE64_CHARS`），超限直接返回 422。
@@ -775,6 +781,16 @@ query 使用、经验冲突材料为何使单 Agent 必然失真）见 `docs/为
   降级工单只渲染它真正有的字段，不补空的"维修方案"章节
 - **配置现代化**：`config.py` 从已废弃的 `class Config` 改为 `SettingsConfigDict`（Pydantic v2 起弃用，v3 将移除）
 - **CI**：新增 ruff 静态检查；原型脚本归档到 `legacy/`
+- **容器入口不再指向已弃用的前端**：`entrypoint.sh` 此前仍在 `streamlit run app.py`（:8501），
+  而 README 已写着「旧前端不是日常入口」——文档与部署形态对不上，容器起来跑的是没人维护的界面。
+  现入口只起 FastAPI（并用 `exec` 让 uvicorn 直接成为 PID 1，信号处理比原来的 `trap` + `wait` 更可靠），
+  `Dockerfile` 改 `EXPOSE 8000`，compose 移除 8501 映射。
+  顺着清掉两处死重量：`requirements-runtime.txt` 不再装 `streamlit` / `pandas`
+  （正式代码里只有 `app.py` 用它们）；`config.py` 的 `STREAMLIT_PORT` / `STREAMLIT_ADDRESS`
+  是只定义、从未被读取的死配置。
+  另修掉一处真 bug：`启动公网隧道.bat` 此前把隧道指向 8501，**等于把已弃用的前端暴露到公网**；
+  现改为指向 React 前端 5173（Vite 会把 `/api` 代理到 8000，隧道过去端到端可用），
+  并按项目约定重写为纯 ASCII + CRLF
 
 ### 待办
 

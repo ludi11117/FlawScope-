@@ -10,6 +10,6 @@ RUN pip install --no-cache-dir -r requirements-runtime.txt
 
 COPY . .
 
-EXPOSE 8000 8501
+EXPOSE 8000
 
 CMD ["/bin/sh", "/app/entrypoint.sh"]
