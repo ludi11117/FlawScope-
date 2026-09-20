@@ -52,19 +52,20 @@ def test_initial_state_is_not_ready():
     assert st["ready"] is False
     assert st["error"] is None
     assert st["elapsed_ms"] is None
+    assert st["warnings"] == []
 
 
 def test_set_step_records_progress_but_does_not_claim_ready():
     """推进步骤只更新进度，绝不能顺带把 ready 置真。
 
-    这是"进度条走到 5/5 就等于可用"这类偷懒实现的判别式：
+    这是"进度条走到 6/6 就等于可用"这类偷懒实现的判别式：
     进度走完 ≠ 初始化成功，就绪必须由 mark_ready 显式宣告。
     """
-    startup_status.set_step("加载向量库", 5, 5)
+    startup_status.set_step("校验知识库", 6, 6)
     st = startup_status.snapshot()
-    assert st["step"] == "加载向量库"
-    assert st["step_index"] == 5
-    assert st["step_total"] == 5
+    assert st["step"] == "校验知识库"
+    assert st["step_index"] == 6
+    assert st["step_total"] == 6
     assert st["ready"] is False
 
 
@@ -89,14 +90,23 @@ def test_mark_failed_keeps_not_ready_and_records_reason():
 
 
 def test_snapshot_is_a_copy_not_a_live_reference():
-    """快照必须是拷贝。
+    """快照必须是拷贝——标量和列表都要。
 
     返回内部 dict 的引用会让调用方（或测试）无意间改写全局状态，
-    而且这种 bug 只在并发下才暴露。这里断言改快照不影响真实状态。
+    而且这种 bug 只在并发下才暴露。
+
+    列表要单独再拷一层：`dict(_state)` 是浅拷贝，`warnings` 还是同一个对象，
+    `snap["warnings"].append(...)` 就能污染模块状态。所以这里对列表也断言一遍，
+    只测标量会让"浅拷贝漏了列表"这种情况照样绿。
     """
     snap = startup_status.snapshot()
     snap["ready"] = True
     assert startup_status.snapshot()["ready"] is False
+
+    startup_status.add_warning("原始警告")
+    snap = startup_status.snapshot()
+    snap["warnings"].append("被调用方塞进去的")
+    assert startup_status.snapshot()["warnings"] == ["原始警告"]
 
 
 def test_reset_restores_initial_state():
@@ -131,11 +141,11 @@ def test_503_body_still_carries_progress():
     否则前端只能显示"正在启动"，用户不知道还要等多久、也判断不出是不是卡住了。
     状态码给机器看，body 给人看，两者都要有。
     """
-    startup_status.set_step("加载向量库", 4, 5)
+    startup_status.set_step("加载向量库", 5, 6)
     body = _client().get("/health/ready").json()
     assert body["step"] == "加载向量库"
-    assert body["step_index"] == 4
-    assert body["step_total"] == 5
+    assert body["step_index"] == 5
+    assert body["step_total"] == 6
 
 
 def test_ready_endpoint_returns_200_after_mark_ready():
@@ -236,11 +246,14 @@ def test_lifespan_reports_steps_and_marks_ready(monkeypatch):
     """
     steps_seen: list[str] = []
 
-    # 把五个初始化步骤全换成桩：单测不能真去加载向量库
+    # 把六个初始化步骤全换成桩：单测不能真去加载向量库
     monkeypatch.setattr(api, "configure_logging", lambda: None)
     monkeypatch.setattr(api, "init_db", lambda: None)
     monkeypatch.setattr(api, "get_llm", lambda: None)
     monkeypatch.setattr(api, "get_embeddings", lambda: None)
+    # 桩到 agents 层的取数函数（而不是桩 `_check_knowledge_base` 本身），
+    # 这样"校验知识库"这一步的函数体仍会被真实执行，接线断了能测出来。
+    monkeypatch.setattr(api, "get_knowledge_base_size", lambda: 73)
 
     real_set_step = startup_status.set_step
 
@@ -254,8 +267,12 @@ def test_lifespan_reports_steps_and_marks_ready(monkeypatch):
         # 进入 with 即跑完 lifespan 的启动段
         assert startup_status.snapshot()["ready"] is True
 
-    assert len(steps_seen) == 5
+    assert len(steps_seen) == 6
     assert "加载向量库" in steps_seen
+    assert "校验知识库" in steps_seen
+    # 库非空时不该产生警告——否则"知识库为空"的提示会天天挂在界面上，
+    # 用户很快就学会忽略它。
+    assert startup_status.snapshot()["warnings"] == []
 
 
 def test_lifespan_marks_failed_when_a_step_raises(monkeypatch):
@@ -281,3 +298,154 @@ def test_lifespan_marks_failed_when_a_step_raises(monkeypatch):
     st = startup_status.snapshot()
     assert st["ready"] is False
     assert "向量库目录不存在" in st["error"]
+
+
+# ---------- 第五组：启动阶段的知识库健康检查 ----------
+#
+# 守的是什么：首次克隆下来没跑 build_knowledge_base.py 时，此前只有**首次检索**
+# 才会发现库是空的——而那时用户已经点下"开始诊断"，白等一轮 9 次 LLM 调用，
+# 最后拿到一张降级工单，看不出根因是"库没建"。
+#
+# 这里同样要**对偶**：既测"空库要提示"，也测"查不到不能报成空库"。
+# 只测前者的话，把 -1 和 0 合并实现（都报"知识库为空"）照样能过。
+
+class _FakeCollection:
+    def __init__(self, n: int = 73, boom: bool = False):
+        self._n, self._boom = n, boom
+
+    def count(self) -> int:
+        if self._boom:
+            raise RuntimeError("sqlite 数据库被锁住")
+        return self._n
+
+
+class _FakeDb:
+    """假的 Chroma：`get()` 一律抛异常，用来钉住"必须走 count() 而不是 get()"。"""
+
+    def __init__(self, n: int = 73, boom: bool = False):
+        self._collection = _FakeCollection(n, boom)
+
+    def get(self, *args, **kwargs):  # pragma: no cover - 只在实现走错时触发
+        raise AssertionError(
+            "get_knowledge_base_size() 不该调用 get()：它会把全部文档 materialize 出来"
+        )
+
+
+def test_kb_size_uses_count_not_get(monkeypatch):
+    """必须走 `_collection.count()`，不能 `len(get()["ids"])`。
+
+    判别式：假 db 的 `get()` 直接抛异常，只要实现走了 get() 就会失败。
+    只断言"返回值是 73"是不够的——两种写法都能返回 73。
+    """
+    import agents
+
+    monkeypatch.setattr(agents, "get_db", lambda: _FakeDb(73))
+    assert agents.get_knowledge_base_size() == 73
+
+
+def test_kb_size_returns_minus_one_when_count_fails(monkeypatch):
+    """取不到时返回 -1，不是 0。"""
+    import agents
+
+    monkeypatch.setattr(agents, "get_db", lambda: _FakeDb(boom=True))
+    assert agents.get_knowledge_base_size() == -1
+
+
+def test_kb_size_returns_minus_one_when_db_unavailable(monkeypatch):
+    """连向量库都拿不到时同样是 -1，而不是抛出去把启动搞挂。"""
+    import agents
+
+    def _boom():
+        raise RuntimeError("向量库目录不存在")
+
+    monkeypatch.setattr(agents, "get_db", _boom)
+    assert agents.get_knowledge_base_size() == -1
+
+
+def test_add_warning_accumulates_and_does_not_clear_previous():
+    """警告是累积的。
+
+    启动步骤会依次上报进度，若 `add_warning` 顺手清空，先记的警告会被后一步抹掉——
+    表现为"偶发看不到提示"，很难复现。
+    """
+    startup_status.add_warning("第一条")
+    startup_status.add_warning("第二条")
+    assert startup_status.snapshot()["warnings"] == ["第一条", "第二条"]
+
+
+def test_reset_clears_warnings():
+    """复位必须清警告，否则前一个用例的警告会泄漏到后一个用例。"""
+    startup_status.add_warning("脏数据")
+    startup_status.reset_for_tests()
+    assert startup_status.snapshot()["warnings"] == []
+
+
+def _run_lifespan_with_kb(monkeypatch, size: int):
+    """跑一遍真实 lifespan，把知识库块数桩成 size。"""
+    monkeypatch.setattr(api, "configure_logging", lambda: None)
+    monkeypatch.setattr(api, "init_db", lambda: None)
+    monkeypatch.setattr(api, "get_llm", lambda: None)
+    monkeypatch.setattr(api, "get_embeddings", lambda: None)
+    monkeypatch.setattr(api, "get_chroma_db", lambda: None)
+    monkeypatch.setattr(api, "get_knowledge_base_size", lambda: size)
+    with TestClient(api.app):
+        pass
+
+
+def test_empty_knowledge_base_warns_but_still_reports_ready(monkeypatch):
+    """库为空时：**要提示**，但**不能判成启动失败**。
+
+    判成失败是过度反应——历史页、统计页都还能用，`/diagnose` 也会诚实地降级产出工单。
+    真正要修的是"时机"：让用户在动手之前就看到，而不是事后从降级工单反推根因。
+    """
+    _run_lifespan_with_kb(monkeypatch, 0)
+    st = startup_status.snapshot()
+    assert st["ready"] is True
+    assert st["error"] is None
+    assert len(st["warnings"]) == 1
+    assert "知识库为空" in st["warnings"][0]
+    assert "build_knowledge_base.py" in st["warnings"][0]
+
+
+def test_empty_knowledge_base_warning_reaches_the_ready_endpoint(monkeypatch):
+    """警告必须真的走到 `/health/ready` 的响应体里。
+
+    只断言 `startup_status` 里有警告是不够的——端点忘了带上它，
+    前端就永远看不到，而所有单测照样绿（"函数改对了 ≠ 调用点接对了"）。
+    """
+    _run_lifespan_with_kb(monkeypatch, 0)
+    body = _client().get("/health/ready").json()
+    assert body["ready"] is True
+    assert len(body["warnings"]) == 1
+    assert "知识库为空" in body["warnings"][0]
+
+
+def test_non_empty_knowledge_base_produces_no_warning(monkeypatch):
+    """库正常时**不得**有警告——否则提示天天挂着，用户很快学会忽略它。"""
+    _run_lifespan_with_kb(monkeypatch, 73)
+    assert startup_status.snapshot()["warnings"] == []
+    assert _client().get("/health/ready").json()["warnings"] == []
+
+
+def test_count_failure_is_not_reported_as_empty_knowledge_base(monkeypatch):
+    """对偶测试：查不到（-1）**不得**报成"知识库为空"。
+
+    两者合并会把"路径/权限/依赖出问题"误报成"库没建"，把人引向错误的排查方向。
+    这与项目的诚实性立场是同一条：说清是"没有"还是"不知道"，别用前者冒充后者。
+    """
+    _run_lifespan_with_kb(monkeypatch, -1)
+    warnings = startup_status.snapshot()["warnings"]
+    assert len(warnings) == 1
+    assert "读取失败" in warnings[0]
+    assert "知识库为空" not in warnings[0]
+    assert "build_knowledge_base.py" not in warnings[0]
+
+
+def test_warnings_field_present_even_when_not_ready():
+    """未就绪时的 503 响应体也要带 `warnings` 字段（空列表）。
+
+    少了这个键，前端解析 `body.warnings` 会拿到 undefined；
+    在"启动中"这段最容易出问题的窗口里，恰恰不该再引入一种新的未定义状态。
+    """
+    body = _client().get("/health/ready").json()
+    assert body["warnings"] == []

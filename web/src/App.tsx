@@ -13,7 +13,7 @@ import { DiagnosePage } from './pages/DiagnosePage'
 import { HistoryPage } from './pages/HistoryPage'
 import { StatsPage } from './pages/StatsPage'
 import { useHealth } from './hooks/useHealth'
-import { HEALTH_META, startupHint } from './api/health'
+import { degradedHint, HEALTH_META, startupHint } from './api/health'
 
 type Route = 'diagnose' | 'history' | 'stats'
 
@@ -133,9 +133,11 @@ export function App() {
           title={
             health.state === 'starting'
               ? startupHint(health.ready)
-              : health.version
-                ? `后端版本 ${health.version}，点击重新探活`
-                : '点击重新探活'
+              : health.state === 'degraded'
+                ? degradedHint(health.ready)
+                : health.version
+                  ? `后端版本 ${health.version}，点击重新探活`
+                  : '点击重新探活'
           }
           style={{
             marginLeft: 'auto',

@@ -17,6 +17,8 @@ from agents import (
     is_info_sufficient,
     generate_followup_question,
     _phenomenon_too_vague,
+    _STRONG_DETAIL_SIGNALS,
+    _WEAK_DETAIL_SIGNALS,
 )
 
 
@@ -63,6 +65,65 @@ class TestPhenomenonTooVague:
         硬把『震 + 响』也判粗会逼正常用户重写，对老用户徒增打扰。"""
         assert _phenomenon_too_vague(["震", "响"]) is False
         assert _phenomenon_too_vague(["震", "响", "热"]) is False
+
+
+# ==================== 强弱信号分级（纯时间词不得放行） ====================
+
+class TestWeakSignalGrading:
+    """弱信号（纯时间 / 频率副词）单独出现时，必须仍判为过粗。
+
+    根因 case：「数控机床转起来一直响」——含"一直"曾被当成细化信号放行，
+    但库里没有数控机床，检索必然落空 → 降级转人工。用户看到的就是
+    "随便一句话都转人工"，而实际上系统本可以追问"哪个部位响"。
+
+    判据：这个信号能不能作为检索的区分维度？「一直 / 突然 / 每次」对任何
+    设备、任何故障都成立，零区分度。
+
+    对偶：本类的拦下用例 + 放行用例缺一不可——只测拦下会让判定越收越紧，
+    把"主轴一直响"这种正常描述也拦掉。
+    """
+
+    @pytest.mark.parametrize("phrase", [
+        "转起来一直响",   # 用户截图原话：含"一直"曾被放行
+        "一直响",
+        "突然响",
+        "间歇响",
+        "每次响",
+        "逐渐响",
+        "连续响",
+    ])
+    def test_weak_signal_alone_is_vague(self, phrase):
+        """只有时间 / 频率副词 → 仍算粗粒度，走追问而不是去检索。"""
+        assert _phenomenon_too_vague([phrase]) is True, f"应拦下追问: {phrase!r}"
+
+    @pytest.mark.parametrize("phrase", [
+        "主轴一直响",      # 弱信号 + 部件
+        "一直异响",        # 弱信号 + 声音术语
+        "加工时一直响",     # 弱信号 + 工况
+        "开机突然响",      # 弱信号 + 工况
+    ])
+    def test_weak_plus_strong_not_vague(self, phrase):
+        """弱信号配上任一强信号 → 放行。收紧的同时不能误伤正常描述。"""
+        assert _phenomenon_too_vague([phrase]) is False, f"应放行: {phrase!r}"
+
+    def test_weak_signals_excluded_from_strong(self):
+        """弱信号不得出现在强信号表里——混进去等于这条分级被静默绕过。
+
+        退化验证：把任一弱信号加进 _STRONG_DETAIL_SIGNALS，本测试必须变红。
+        """
+        assert _WEAK_DETAIL_SIGNALS, "弱信号表不应为空"
+        for w in _WEAK_DETAIL_SIGNALS:
+            assert w not in _STRONG_DETAIL_SIGNALS, f"弱信号误入强信号表: {w!r}"
+
+    def test_screenshot_case_insufficient_at_fault_info_level(self):
+        """端到端：截图 case 整体判为信息不足，而不是检索落空后降级转人工。"""
+        fault_info = {
+            "设备类型": "数控机床",
+            "故障现象": ["转起来一直响"],
+            "报警代码": "",
+            "排除条件": [],
+        }
+        assert is_info_sufficient(fault_info) is False
 
 
 # ==================== is_info_sufficient 对偶测试 ====================

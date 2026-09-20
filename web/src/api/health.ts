@@ -45,7 +45,40 @@ export interface ReadyPayload {
   step_total: number
   elapsed_ms: number | null
   error: string | null
+  /**
+   * "能启动、但某些能力不可用"的提示（如知识库为空）。
+   * 可选：旧后端不返回该字段，别把它当成必填去解引用。
+   */
+  warnings?: string[]
   version: string
+}
+
+/**
+ * 取出后端上报的启动警告。
+ *
+ * 单独抽一个纯函数（而不是各处写 `ready?.warnings ?? []`）是为了收敛两件事：
+ *
+ *   1. **"字段缺失"与"空数组"必须等价**——都表示"没有警告"。
+ *      旧后端不返回该字段，若把它当成异常去处理，前端会在升级窗口里报假故障。
+ *   2. **挡掉非字符串元素**。后端字段一旦变成别的形状（对象数组、null 混入），
+ *      直接渲染进 JSX 会把 `[object Object]` 显示给用户——
+ *      而这种错在类型上是看不出来的（响应体是运行时解析的 JSON）。
+ */
+export function readyWarnings(ready: ReadyPayload | null): string[] {
+  const raw = ready?.warnings
+  if (!Array.isArray(raw)) return []
+  return raw.filter((w): w is string => typeof w === 'string' && w.trim() !== '')
+}
+
+/**
+ * `degraded` 状态的 hover 提示：把后端上报的具体警告显示出来。
+ *
+ * 没有它，状态灯就只剩"服务降级"四个字——用户知道出事了但不知道是什么事，
+ * 也就无法判断"现在能不能用、要不要先去建知识库"。
+ */
+export function degradedHint(ready: ReadyPayload | null): string {
+  const ws = readyWarnings(ready)
+  return ws.length > 0 ? ws.join('；') : '服务可用，但部分能力受限'
 }
 
 /** 一次探活的原始观测结果，由 `useHealth` 采集、交给下面的纯函数判定。 */
@@ -72,7 +105,17 @@ export interface ProbeObservation {
  * 正是这次要修的缺陷。
  */
 export function healthStateFromProbe(obs: ProbeObservation): HealthState {
-  if (obs.readyStatus === 200) return 'up'
+  if (obs.readyStatus === 200) {
+    // 就绪但带警告（如知识库为空）→ degraded，而不是 up。
+    //
+    // 这正是 degraded 这个状态被预留出来要表达的东西：请求能成功，
+    // 但结果会退化。判成 up 会把它藏起来——用户要等到白等一轮 9 次 LLM 调用、
+    // 拿到一张降级工单，才知道根因是"知识库没建"。
+    //
+    // 注意 degraded **不阻断**诊断（前端只把 starting / down 当作阻断态）：
+    // 知识库为空时 `/diagnose` 仍会诚实地降级产出工单，不让用户试反而是过度反应。
+    return readyWarnings(obs.ready).length > 0 ? 'degraded' : 'up'
+  }
   // 503 是后端"有意表达的未就绪"，不是错误
   if (obs.readyStatus === 503) return 'starting'
   // ready 端点不存在（404，旧后端 / 网关没配路由）时回退到 liveness 判定：

@@ -8,7 +8,11 @@ from agents import (
     retrieve_evidence, agent_diagnose, agent_review,
     agent_cost, agent_workorder, agent_rebuttal, agent_review_final,
     extract_fault_info, is_info_sufficient, generate_followup_question,
-    extract_image_info, check_relevance, is_equipment_in_evidence
+    extract_image_info, check_relevance, is_equipment_in_evidence,
+    build_degraded_report,
+    DEGRADED_REASON_NO_HIT, DEGRADED_REASON_EQUIPMENT_MISMATCH,
+    DEGRADED_REASON_IRRELEVANT, DEGRADED_REASON_RELEVANCE_UNKNOWN,
+    DEGRADED_REASON_LLM_FAILED,
 )
 from config import settings
 from logging_config import get_logger, get_token_tracker, clear_token_tracker
@@ -200,12 +204,14 @@ def diagnose_node(state: AgentState) -> AgentState:
 
     if "【知识库无相关依据】" in evidence:
         logger.warning("diagnose_degraded_no_evidence", correlation_id=state["correlation_id"])
+        report = build_degraded_report(fault_info, DEGRADED_REASON_NO_HIT)
         return {
             "diagnosis": {
                 "报警代码": "N/A",
                 "根因判断": "知识库无相关依据，无法诊断",
                 "依据": "无",
-                "排查建议": ["建议人工介入或补充知识库"]
+                "排查建议": report["下一步建议"],
+                "降级说明": report["判定说明"],
             },
             "status": "insufficient_knowledge"
         }
@@ -213,12 +219,14 @@ def diagnose_node(state: AgentState) -> AgentState:
     # 确定性护栏：设备类型/报警代码不在资料中 → 跨设备幻觉，直接降级
     if not is_equipment_in_evidence(fault_info, evidence):
         logger.warning("diagnose_degraded_equipment_mismatch", correlation_id=state["correlation_id"])
+        report = build_degraded_report(fault_info, DEGRADED_REASON_EQUIPMENT_MISMATCH)
         return {
             "diagnosis": {
                 "报警代码": "N/A",
                 "根因判断": "知识库无该设备的相关依据，无法诊断",
                 "依据": "无",
-                "排查建议": ["建议人工介入或补充知识库"]
+                "排查建议": report["下一步建议"],
+                "降级说明": report["判定说明"],
             },
             "status": "insufficient_knowledge"
         }
@@ -227,12 +235,14 @@ def diagnose_node(state: AgentState) -> AgentState:
     relevance = check_relevance(state["user_input"], evidence, correlation_id=state["correlation_id"])
     if relevance is False:
         logger.warning("diagnose_degraded_irrelevant", correlation_id=state["correlation_id"])
+        report = build_degraded_report(fault_info, DEGRADED_REASON_IRRELEVANT)
         return {
             "diagnosis": {
                 "报警代码": "N/A",
                 "根因判断": "检索资料与故障不相关，无法诊断",
                 "依据": "无",
-                "排查建议": ["建议人工介入或补充知识库"]
+                "排查建议": report["下一步建议"],
+                "降级说明": report["判定说明"],
             },
             "status": "insufficient_knowledge"
         }
@@ -240,12 +250,14 @@ def diagnose_node(state: AgentState) -> AgentState:
         # 相关性没验成（模型不可用）。此时继续诊断风险太高，同样停止自动流程，
         # 但理由必须写清楚是"校验未完成"，而不是甩锅给"资料不相关"。
         logger.warning("diagnose_degraded_relevance_unknown", correlation_id=state["correlation_id"])
+        report = build_degraded_report(fault_info, DEGRADED_REASON_RELEVANCE_UNKNOWN)
         return {
             "diagnosis": {
                 "报警代码": "N/A",
                 "根因判断": "相关性校验未能完成，无法确认资料可用性",
                 "依据": "无",
-                "排查建议": ["请稍后重试；若持续失败请检查模型服务"]
+                "排查建议": report["下一步建议"],
+                "降级说明": report["判定说明"],
             },
             "status": "llm_failed"
         }
@@ -263,7 +275,11 @@ def diagnose_node(state: AgentState) -> AgentState:
     if not diagnosis:
         # 模型调用失败 / 输出无法通过 Schema 校验：立刻停止，别让空诊断流进辩论环节
         logger.error("diagnose_llm_failed", correlation_id=state["correlation_id"])
-        return {"diagnosis": dict(LLM_FAILED_DIAGNOSIS), "status": "llm_failed"}
+        report = build_degraded_report(fault_info, DEGRADED_REASON_LLM_FAILED)
+        failed = dict(LLM_FAILED_DIAGNOSIS)
+        failed["排查建议"] = report["下一步建议"]
+        failed["降级说明"] = report["判定说明"]
+        return {"diagnosis": failed, "status": "llm_failed"}
 
     logger.info("diagnose_done", has_diagnosis=True, correlation_id=state["correlation_id"])
     return {"diagnosis": diagnosis, "status": "diagnosed"}
@@ -391,6 +407,21 @@ def cost_node(state: AgentState) -> AgentState:
     return {"cost": cost, "status": "costed"}
 
 
+def _compose_risk_note(head: str, degraded_note: str, tips: list) -> str:
+    """把「降级原因 + 判定说明 + 下一步建议」拼成一段可读的风险说明。
+
+    降级工单本来就只有「工单编号 / 风险等级 / 风险说明」三样（硬约束 20），
+    所以往风险说明里补具体内容**不违反**"不得补出空的维修方案"——这里补的是
+    已知事实和下一步动作，不是编造的根因或维修步骤。
+    """
+    parts = [head.rstrip("。")]
+    if degraded_note:
+        parts.append(degraded_note.rstrip("。"))
+    if tips:
+        parts.append("可尝试：" + "；".join(str(t) for t in tips))
+    return "。".join(parts) + "。"
+
+
 def workorder_node(state: AgentState) -> AgentState:
     workorder = agent_workorder(
         _effective_diagnosis(state), _effective_review(state), state["cost"],
@@ -421,13 +452,21 @@ def workorder_node(state: AgentState) -> AgentState:
         workorder["风险等级"] = "高风险待复核"
         workorder["风险说明"] = "诊断结论经多轮辩论仍未通过审核，建议人工复核后执行"
 
+    # 降级时把"为什么答不了 + 下一步能做什么"一并写进风险说明。
+    # 此前只有一句「建议人工介入」，用户拿到手等于没拿到东西。
+    diag = _effective_diagnosis(state)
+    degraded_note = (diag.get("降级说明") or "").strip()
+    tips = diag.get("排查建议") or []
+
     # 知识库无依据直接降级时，同样标记
     if status == "insufficient_knowledge":
         workorder["风险等级"] = "待人工确认（知识库无依据）"
-        workorder["风险说明"] = "知识库未覆盖该设备，无法自动诊断，建议人工介入或补充知识库"
+        workorder["风险说明"] = _compose_risk_note(
+            "知识库未覆盖该故障的相关依据，无法自动诊断", degraded_note, tips)
     elif status == "llm_failed":
         workorder["风险等级"] = "待人工确认（模型服务异常）"
-        workorder["风险说明"] = "诊断链路中模型调用失败，结论可能不完整，请人工复核后再执行"
+        workorder["风险说明"] = _compose_risk_note(
+            "诊断链路中模型调用失败，结论可能不完整，请人工复核后再执行", degraded_note, tips)
     elif status == "pending_human_review":
         # 审核阶段判定诊断结论不可采信。此前这条路径直接 END、不出工单，
         # 用户只看到一句红字报错；现在同样产出工单，只是明确标注不可直接执行。

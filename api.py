@@ -15,11 +15,22 @@ from database import (
     save_diagnosis_record, get_records, count_records, get_distinct_statuses,
     get_record_by_id, delete_record, get_stats, init_db
 )
-from agents import get_db as get_chroma_db, get_llm, get_embeddings
+from agents import (
+    get_db as get_chroma_db,
+    get_llm,
+    get_embeddings,
+    get_knowledge_base_size,
+)
 from config import settings
 from logging_config import get_logger, configure_logging
 from workorder_export import workorder_to_markdown, workorder_filename
-from startup_status import set_step, mark_ready, mark_failed, snapshot as startup_snapshot
+from startup_status import (
+    set_step,
+    mark_ready,
+    mark_failed,
+    add_warning,
+    snapshot as startup_snapshot,
+)
 
 logger = get_logger(__name__)
 
@@ -52,6 +63,30 @@ def require_api_key(x_api_key: str = Header(default="")):
 
 
 @asynccontextmanager
+def _check_knowledge_base() -> None:
+    """启动阶段显式检查向量库是否已构建（首次克隆最容易踩的坑）。
+
+    此前这件事只在**首次检索**（`agents._init_bm25`）才会被发现——而那时用户已经
+    点下"开始诊断"，拿到的是一张降级工单，看不出根因是"没跑 build_knowledge_base.py"。
+    等到降级发生再说，代价是用户白等一轮 9 次 LLM 调用。
+
+    这里**不抛异常、不判失败**：知识库为空时历史页/统计页仍可用，`/diagnose` 也会
+    诚实地降级产出工单，判成"启动失败"是过度反应。但必须让调用方**在动手之前**看到，
+    所以走 `add_warning`，由 `/health/ready` 带出去、前端状态灯显示。
+    """
+    size = get_knowledge_base_size()
+    if size < 0:
+        # 查不到 ≠ 是空的。合并两者会把"路径/权限/依赖出问题"误报成"知识库没建"。
+        add_warning("向量库块数读取失败，无法确认知识库是否已构建；诊断可能降级")
+    elif size == 0:
+        add_warning(
+            "知识库为空：请先执行 build_knowledge_base.py 构建向量库，"
+            "否则诊断会因缺少依据而降级"
+        )
+    else:
+        logger.info("knowledge_base_ready", chunks=size)
+
+
 async def lifespan(app: FastAPI):
     """应用生命周期管理。
 
@@ -67,6 +102,8 @@ async def lifespan(app: FastAPI):
         ("加载模型客户端", get_llm),
         ("加载嵌入模型", get_embeddings),
         ("加载向量库", get_chroma_db),
+        # 放在最后：它要读向量库，必须等上一步加载完。空库不判失败，只记警告。
+        ("校验知识库", _check_knowledge_base),
     ]
     total = len(steps)
 
@@ -427,6 +464,9 @@ def health_ready():
         "step_total": st["step_total"],
         "elapsed_ms": st["elapsed_ms"],
         "error": st["error"],
+        # "起来了但会退化"的提示（如知识库为空）。放在 ready 载荷里而不是只写日志，
+        # 是因为用户要在点"开始诊断"**之前**看到——事后从降级工单反推根因太贵。
+        "warnings": st["warnings"],
         "version": API_VERSION,
     }
     if not st["ready"]:

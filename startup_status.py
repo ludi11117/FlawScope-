@@ -44,6 +44,9 @@ _state: Dict[str, Any] = {
     "error": None,
     # 启动耗时（毫秒），就绪后填充
     "elapsed_ms": None,
+    # "能启动、但某些能力不可用"的提示（如知识库为空）。
+    # 与 error 的区别：error 是"起不来"，warnings 是"起来了但会退化"。
+    "warnings": [],
 }
 
 
@@ -73,10 +76,32 @@ def mark_failed(reason: str) -> None:
         _state["error"] = reason
 
 
-def snapshot() -> Dict[str, Any]:
-    """读取当前状态快照（拷贝，调用方拿到的是不可变视图）。"""
+def add_warning(message: str) -> None:
+    """记录一条"能启动、但功能会退化"的警告。
+
+    为什么需要它（而不是直接 `mark_failed`）：知识库为空时，历史页、统计页都还能用，
+    `/diagnose` 也会**诚实地降级**并产出带风险标记的工单——把它判成"启动失败"是过度反应。
+    真正的问题是**时机**：此前只有首次检索（`agents._init_bm25`）才会发现库是空的，
+    而那时用户已经点下"开始诊断"了，拿到的是一张降级工单，看不出根因是
+    "没跑 build_knowledge_base.py"。启动阶段就说清楚，比事后猜便宜得多。
+
+    刻意**不清空已有警告**：启动步骤会依次上报进度，若每步都重置，先记录的警告会被后一步抹掉。
+    """
     with _lock:
-        return dict(_state)
+        _state["warnings"] = [*_state["warnings"], message]
+
+
+def snapshot() -> Dict[str, Any]:
+    """读取当前状态快照（拷贝，调用方拿到的是不可变视图）。
+
+    注意 `warnings` 要**单独再拷一层**：`dict(_state)` 是浅拷贝，列表还是同一个对象，
+    调用方 `snapshot()["warnings"].append(...)` 就能改到模块内部状态。
+    标量字段靠浅拷贝就够了，列表不行。
+    """
+    with _lock:
+        st = dict(_state)
+        st["warnings"] = list(_state["warnings"])
+        return st
 
 
 def reset_for_tests() -> None:
@@ -96,5 +121,6 @@ def reset_for_tests() -> None:
                 "ready": False,
                 "error": None,
                 "elapsed_ms": None,
+                "warnings": [],
             }
         )

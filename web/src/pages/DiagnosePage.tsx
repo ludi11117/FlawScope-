@@ -12,7 +12,7 @@ import { useHealth } from '../hooks/useHealth'
 import { StateMachineView } from '../components/StateMachineView'
 import { ResultView } from '../components/ResultView'
 import { workorderUrl } from '../api/client'
-import { startupHint } from '../api/health'
+import { readyWarnings, startupHint } from '../api/health'
 import { btnStyle } from '../ui/button'
 
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024
@@ -149,6 +149,40 @@ export function DiagnosePage() {
               </div>
             </>
           )}
+        </div>
+      )}
+
+      {/* 服务降级提示。与上面的"不可用"不同：这里**不阻断**诊断——
+          知识库为空时 `/diagnose` 仍会诚实地降级并产出带风险标记的工单，
+          不让用户试反而是过度反应。
+          要解决的是**时机**问题：此前只有首次检索才会发现库是空的，
+          那时用户已经白等了一轮 9 次 LLM 调用、拿到一张降级工单，
+          却看不出根因是"没跑 build_knowledge_base.py"。
+          用 warning 琥珀色（而不是 accent 蓝）：这不是正常过程，是需要注意的状态。 */}
+      {health.state === 'degraded' && (
+        <div
+          className="fs-banner fs-rise"
+          data-testid="degraded-banner"
+          style={{
+            padding: '11px 14px',
+            borderRadius: 'var(--radius-md)',
+            background: 'var(--warning-soft)',
+            border: '0.5px solid var(--warning)',
+            color: '#633806',
+            fontSize: 13,
+            lineHeight: 1.6,
+            marginBottom: 16,
+          }}
+        >
+          <b>服务可用，但会降级。</b>
+          <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+            {readyWarnings(health.ready).map((w) => (
+              <li key={w}>{w}</li>
+            ))}
+          </ul>
+          <div style={{ marginTop: 3, opacity: 0.85 }}>
+            仍可发起诊断，但结果可能因缺少依据而降级；修好后点顶栏状态灯重新探活。
+          </div>
         </div>
       )}
 

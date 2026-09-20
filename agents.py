@@ -130,6 +130,25 @@ def get_db() -> Chroma:
     return _db
 
 
+def get_knowledge_base_size() -> int:
+    """返回向量库当前的块数；**取不到时返回 -1**，不要把它当成 0。
+
+    两个刻意的设计：
+
+    1. **不用 `len(get_db().get()["ids"])`**：那会把全部文档 materialize 出来，
+       知识库到万级条目后，启动阶段白白多读一遍。`_collection.count()` 是计数查询。
+    2. **-1 与 0 必须分开**：0 的含义是"库确实是空的，请先跑 build_knowledge_base.py"；
+       -1 的含义是"没查出来，可能是路径/权限/依赖出了问题"。
+       把两者合并会让人顺着错误的方向排查——这与"诚实降级"是同一条原则：
+       说清楚是"没有"还是"不知道"，别用前者冒充后者。
+    """
+    try:
+        return get_db()._collection.count()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("knowledge_base_count_failed", error=str(e))
+        return -1
+
+
 # ========== 熔断器模式 ==========
 
 class CircuitBreaker:
@@ -1266,6 +1285,86 @@ def _is_degraded_text(text: str) -> bool:
     return any(m in (text or "") for m in _DEGRADED_MARKERS)
 
 
+# ========== 降级报告：答不了的时候，也要交出可用的东西 ==========
+
+DEGRADED_REASON_NO_HIT = "no_hit"
+DEGRADED_REASON_EQUIPMENT_MISMATCH = "equipment_mismatch"
+DEGRADED_REASON_IRRELEVANT = "irrelevant"
+DEGRADED_REASON_RELEVANCE_UNKNOWN = "relevance_unknown"
+DEGRADED_REASON_LLM_FAILED = "llm_failed"
+
+
+def build_degraded_report(
+    fault_info: dict,
+    degraded_reason: str,
+    kb_size: int = None,
+) -> dict:
+    """降级时生成可用的补充信息：判定说明 + 下一步建议。**纯函数，零 LLM 调用。**
+
+    为什么要这个：此前降级工单只有「工单编号 / 风险等级 / 风险说明」三行，
+    风险说明还是「知识库未覆盖该设备，无法自动诊断，建议人工介入」这种空话——
+    用户拿到手等于没拿到东西。**降级不等于可以不输出。**
+
+    三条设计约束（与硬约束 4「诚实降级」配套，不冲突）：
+
+    1. **不补根因**。降级就是不知道根因；这里只输出「已知的事实」与
+       「你接下来能做什么」，绝不用推测冒充结论。
+    2. **不依赖 LLM**。降级往往正是模型不可用的时候，再调一次模型等于
+       把最后一道防线也交给同一个失败源。
+    3. **库大小必须区分 0 / -1 / N**。`get_knowledge_base_size()` 用 -1 表示
+       「没查出来」，0 表示「确实是空的」。混为一谈会让人顺着错误方向排查——
+       与「诚实降级」是同一条原则：说清楚是「没有」还是「不知道」。
+
+    返回：{"判定说明": str, "下一步建议": [str]}
+    """
+    fault_info = fault_info or {}
+    device = (fault_info.get("设备类型") or "").strip()
+    symptom_text = " ".join(str(s) for s in (fault_info.get("故障现象") or []))
+
+    if kb_size is None:
+        kb_size = get_knowledge_base_size()
+    if kb_size == 0:
+        kb_note = "知识库当前为空（0 个条目）——请先执行 build_knowledge_base.py 构建向量库"
+    elif kb_size is not None and kb_size < 0:
+        kb_note = "知识库规模未能确认（可能未初始化或路径异常）"
+    else:
+        kb_note = f"知识库当前共 {kb_size} 个条目"
+
+    if degraded_reason == DEGRADED_REASON_NO_HIT:
+        verdict = f"{kb_note}，本次检索未命中任何相关条目"
+        next_steps = [
+            "确认设备名是否有其它叫法（如「空压机」与「空气压缩机」），换一种说法重试",
+            "若确属缺失资料：补充该设备故障案例到 data/raw/，再跑 build_knowledge_base.py",
+        ]
+    elif degraded_reason == DEGRADED_REASON_EQUIPMENT_MISMATCH:
+        who = device or "该设备"
+        verdict = f"{kb_note}，未收录「{who}」的相关案例"
+        next_steps = [
+            "请确认设备名是否准确；若库内已有该设备的其它叫法，换说法重试",
+            f"若确实没有「{who}」的资料：补充案例到 data/raw/ 后重跑 build_knowledge_base.py",
+        ]
+    elif degraded_reason == DEGRADED_REASON_IRRELEVANT:
+        verdict = f"{kb_note}，检索到的资料与本故障描述不相关"
+        next_steps = [
+            "有报警代码请直接写出，可显著提升检索命中率",
+            "补充故障发生时的工况：启动 / 加工 / 空载 / 带载",
+        ]
+        # 没说清是哪个部件时，这条最值得问——复用部件词表，不另起一份
+        if not any(p in symptom_text for p in _PART_SIGNALS):
+            next_steps.insert(0, "请说明是哪个部件出问题（如主轴、电机、液压阀、轴承）")
+    elif degraded_reason == DEGRADED_REASON_RELEVANCE_UNKNOWN:
+        verdict = "相关性校验未能完成（模型不可用），无法确认资料是否可用"
+        next_steps = ["请稍后重试", "若持续失败，请检查上游模型服务与网络"]
+    elif degraded_reason == DEGRADED_REASON_LLM_FAILED:
+        verdict = "诊断链路中模型调用失败，结论可能不完整"
+        next_steps = ["请稍后重试", "若持续失败，请检查上游模型服务与网络"]
+    else:
+        verdict = "未能自动诊断"
+        next_steps = ["建议人工介入"]
+
+    return {"判定说明": verdict, "下一步建议": next_steps}
+
+
 def restore_dropped_candidates(initial_root: str, final_root: str, excluded_causes: list = None,
                                initial_evidence: str = "") -> str:
     """护栏：辩论不得把初诊里"有依据且未被排除"的候选原因静默丢掉。
@@ -1533,26 +1632,42 @@ def evaluate_semantic(diagnosis_text: str, expected_text: str, correlation_id: s
 # 单条故障现象若不带任何「细化信号」，视为粗粒度。判定逻辑集中在这里，
 # 而不是塞进正则，避免规则只对一半 corner case 生效、看起来像跑通了。
 # 信号词覆盖：部件名、工况/时间、声、温度、位置、报警/代码。
-_PHENOMENON_DETAIL_SIGNALS = (
-    # 部件 / 部位
+# 强信号：能作为检索的区分维度——说了「哪个部件 / 什么声音 / 什么代码 /
+# 什么工况 / 什么状态」。命中任一即视为已细化，放行去检索。
+# 部件 / 部位。单独抽出来是因为降级报告要复用它判断「用户有没有说清是哪个
+# 部件」——抽成常量再拼接，避免词表出现第二份副本（硬约束 22 的漂移教训）。
+_PART_SIGNALS = (
     "轴", "电机", "轴承", "齿轮", "阀", "泵", "传感器", "冷却", "液压",
     "气动", "伺服", "滚珠", "导轨", "活塞", "缸", "编码器", "控制器",
     "机身", "床身", "主轴", "变速箱", "刀塔", "料盘", "变频器",
+)
+
+_STRONG_DETAIL_SIGNALS = _PART_SIGNALS + (
     # 声音（注意：不用「响」「声」——这两个字单独出现通常是形容词，
     # 「空压机响」「机身有声音」就是单字形容词 + 名词的粗描述；
     # 真正细化的声音信号得是术语：异响、噪音、噪声，或模拟声字）
     "异响", "噪音", "噪声",
     "咣", "嗡", "嘎", "吱", "啸", "嘶", "咔", "嗒", "嘭", "咯噔",
-    # 时间 / 工况
-    "启动", "开机", "关机", "运行", "停机", "加工", "空跑", "空载",
-    "带载", "突然", "一直", "每次", "逐渐", "连续", "间歇",
+    # 工况：启动 / 加工 / 空载指向不同的排查方向，有区分度
+    "启动", "开机", "关机", "运行", "停机", "加工", "空跑", "空载", "带载",
     # 报警 / 故障码
     "报警", "代码", "ALM", "ERR", "E-", "F-", "AL.", "ER.",
-    # 程度 / 频率
+    # 程度 / 严重性：描述故障状态，比纯时间词更有区分度。
+    # 保持强信号也是为了不动既有契约（tests/test_info_sufficiency.py 断言
+    # 「严重震动」应放行）。
     "严重", "明显", "加剧", "加重", "反复", "时轻时重",
     # 温度 / 外观
     "过热", "发烫", "冒烟", "烫", "锈", "漏油", "漏气", "堵塞",
 )
+
+# 弱信号：只描述「发生的时间模式」，不指向任何部件、状态或工况。
+# 「一直响」「突然响」「每次都响」对任何设备任何故障都成立，对检索零区分度。
+_WEAK_DETAIL_SIGNALS = (
+    "突然", "一直", "每次", "逐渐", "连续", "间歇",
+)
+
+# 并集保留原名：既有引用仍可用，也便于退化验证时对照旧写法。
+_PHENOMENON_DETAIL_SIGNALS = _STRONG_DETAIL_SIGNALS + _WEAK_DETAIL_SIGNALS
 
 # 信息不足的三种情形。统一在此判定，被 is_info_sufficient（接口层）
 # 和 generate_followup_question（文案层）共用，防止两边对"什么算充分"
@@ -1565,19 +1680,25 @@ _INSUFFICIENT_VAGUE_SYMPTOMS = "vague_symptoms"
 def _phenomenon_too_vague(symptoms) -> bool:
     """判定故障现象是否过于粗粒度、不足以支撑诊断。
 
-    规则：现象只有 1 项且不含任何细化信号 → 视为过粗（True）。
-    现象 ≥ 2 项或单条但含细化信号 → 不算过粗（False）。
+    规则：现象只有 1 项且不含任何**强**细化信号 → 视为过粗（True）。
+    现象 ≥ 2 项，或单条但含强信号 → 不算过粗（False）。
 
     为什么不允许多粗的并存也不算粗：实际场景里，分多条陈述本身
     就说明用户掌握了不同维度的信号；硬要把"震"+"响"也判成信息不足
     会逼正常用户重写，对"新学徒"没有帮助、对老用户徒增打扰。
+
+    为什么弱信号（"一直""突然""每次"）单独不算数：检索得能靠它缩小范围，
+    而纯时间模式对任何设备任何故障都成立，没有区分度。放行后检索必然
+    落空 → 走到"知识库无依据"降级，用户看到的就是"随便一句话都转人工"。
+    真实 case：「数控机床转起来一直响」——含"一直"就被放行，库里没有数控
+    机床，检索落空后直接转人工；拦下追问（"是哪个部位响？"）要有用得多。
     """
     if not symptoms:
         return True
     if len(symptoms) >= 2:
         return False
     p = (symptoms[0] or "").lower()
-    return not any(s.lower() in p for s in _PHENOMENON_DETAIL_SIGNALS)
+    return not any(s.lower() in p for s in _STRONG_DETAIL_SIGNALS)
 
 
 def _insufficiency_reason(fault_info: dict) -> Optional[str]:

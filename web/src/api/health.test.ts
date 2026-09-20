@@ -17,16 +17,19 @@
 
 import { describe, expect, it } from 'vitest'
 import {
+  degradedHint,
   HEALTH_META,
   HEALTH_STARTUP_POLL_MS,
   healthStateFromProbe,
   healthStateFromResponse,
   nextHealthValue,
   nextPollInterval,
+  readyWarnings,
   shouldPoll,
   startupHint,
   type HealthState,
   type ProbeObservation,
+  type ReadyPayload,
 } from './health'
 
 /** 造一个观测结果，只传关心的字段，避免每条用例都写全五个字段。 */
@@ -40,8 +43,8 @@ const READY_OK: ProbeObservation = obs({
   ready: {
     ready: true,
     step: '启动完成',
-    step_index: 5,
-    step_total: 5,
+    step_index: 6,
+    step_total: 6,
     elapsed_ms: 12000,
     error: null,
     version: '1.3.0',
@@ -287,5 +290,126 @@ describe('shouldPoll', () => {
 
   it('可见与隐藏必须给出相反结论', () => {
     expect(shouldPoll(true)).not.toBe(shouldPoll(false))
+  })
+})
+
+
+// ---------- 启动警告 → degraded 状态 ----------
+//
+// 守的是什么：后端在启动阶段发现"能起来但会退化"（最典型的是知识库为空，
+// 因为克隆下来没跑 build_knowledge_base.py）时会带 `warnings`。
+// 此前这条信息只有 API 调用方看得到，界面上一片正常——
+// 用户点下"开始诊断"、白等一轮 9 次 LLM 调用、拿到一张降级工单，
+// 却看不出根因是"库没建"。
+//
+// 所以这里断言的核心是：**带警告的 200 不能判成 up**。
+// 判成 up 会让状态灯一直绿着，而"绿着"是所有失败里最容易被忽略的一种。
+
+function ready(partial: Partial<ReadyPayload>): ReadyPayload {
+  return {
+    ready: true,
+    step: '启动完成',
+    step_index: 6,
+    step_total: 6,
+    elapsed_ms: 900,
+    error: null,
+    version: '1.3.0',
+    ...partial,
+  }
+}
+
+const KB_EMPTY = '知识库为空：请先执行 build_knowledge_base.py 构建向量库，否则诊断会因缺少依据而降级'
+
+describe('readyWarnings —— 把"字段缺失"与"空数组"收敛成同一种结果', () => {
+  it('后端返回警告时原样取出', () => {
+    expect(readyWarnings(ready({ warnings: [KB_EMPTY] }))).toEqual([KB_EMPTY])
+  })
+
+  it('空数组表示没有警告', () => {
+    expect(readyWarnings(ready({ warnings: [] }))).toEqual([])
+  })
+
+  it('字段缺失（旧后端）也当作没有警告，不得报假故障', () => {
+    // 升级窗口里前端先于后端更新是常态，把"字段不存在"当成异常
+    // 会让前端在这段时间里持续显示降级。
+    expect(readyWarnings(ready({}))).toEqual([])
+  })
+
+  it('ready 为 null（网络层失败）时返回空数组而不抛异常', () => {
+    expect(readyWarnings(null)).toEqual([])
+  })
+
+  it('反向：非字符串元素必须被过滤掉', () => {
+    // 响应体是运行时解析的 JSON，类型系统管不到。
+    // 不过滤的话 `[object Object]` 会直接渲染给用户。
+    const dirty = ready({ warnings: [{ msg: 'x' } as unknown as string, '正常警告'] })
+    expect(readyWarnings(dirty)).toEqual(['正常警告'])
+  })
+
+  it('反向：空白字符串不算警告', () => {
+    expect(readyWarnings(ready({ warnings: ['   ', ''] }))).toEqual([])
+  })
+})
+
+describe('healthStateFromProbe —— 就绪但有警告必须判为 degraded', () => {
+  it('200 且带警告 → degraded，不能判成 up', () => {
+    const o = obs({ live: true, readyStatus: 200, ready: ready({ warnings: [KB_EMPTY] }) })
+    expect(healthStateFromProbe(o)).toBe('degraded')
+  })
+
+  it('反向：200 且无警告 → up（别把所有就绪都判成降级）', () => {
+    expect(healthStateFromProbe(READY_OK)).toBe('up')
+    const o = obs({ live: true, readyStatus: 200, ready: ready({ warnings: [] }) })
+    expect(healthStateFromProbe(o)).toBe('up')
+  })
+
+  it('反向：旧后端不带 warnings 字段 → up', () => {
+    const o = obs({ live: true, readyStatus: 200, ready: ready({}) })
+    expect(healthStateFromProbe(o)).toBe('up')
+  })
+
+  it('degraded 与 up 必须是不同状态（否则降级在界面上看不出来）', () => {
+    const degraded = healthStateFromProbe(
+      obs({ live: true, readyStatus: 200, ready: ready({ warnings: [KB_EMPTY] }) }),
+    )
+    expect(degraded).not.toBe(healthStateFromProbe(READY_OK))
+  })
+
+  it('带警告的 200 不得影响未就绪分支的判定（503 仍是 starting）', () => {
+    // 反向回归：新分支插在 200 判断里，不能把 503 也带偏。
+    const o = obs({ live: true, readyStatus: 503, ready: ready({ ready: false, warnings: [KB_EMPTY] }) })
+    expect(healthStateFromProbe(o)).toBe('starting')
+  })
+})
+
+describe('degradedHint —— 状态灯要能说出"降级在哪"', () => {
+  it('把具体警告拼出来，而不是只说"服务降级"', () => {
+    expect(degradedHint(ready({ warnings: [KB_EMPTY] }))).toContain('build_knowledge_base.py')
+  })
+
+  it('多条警告用分号连接', () => {
+    expect(degradedHint(ready({ warnings: ['甲', '乙'] }))).toBe('甲；乙')
+  })
+
+  it('没有警告可显示时给兜底文案，不能是空字符串', () => {
+    // 空字符串会让 title 属性变成空、hover 什么都不显示——
+    // 状态灯说"降级"却给不出任何解释，比不显示更让人困惑。
+    expect(degradedHint(ready({ warnings: [] }))).not.toBe('')
+    expect(degradedHint(null)).not.toBe('')
+  })
+})
+
+describe('HEALTH_META —— degraded 必须有独立外观', () => {
+  it('degraded 有中文标签', () => {
+    expect(HEALTH_META.degraded.label).toBeTruthy()
+  })
+
+  it('degraded 的配色不得与 up 相同（否则降级看起来和正常一样）', () => {
+    expect(HEALTH_META.degraded.color).not.toBe(HEALTH_META.up.color)
+  })
+
+  it('四个状态的配色两两不同', () => {
+    const colors = (Object.keys(HEALTH_META) as HealthState[]).map((k) => HEALTH_META[k].color)
+    expect(new Set(colors).size).toBe(colors.length)
   })
 })

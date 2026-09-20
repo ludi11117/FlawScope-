@@ -61,6 +61,9 @@ manual_parse_report.json
 # ===== 前端（web/）=====
 # 依赖与构建产物不入库；源码与配置全部入库
 web/node_modules/
+# 根级 node_modules：tools/verify_health_ui.mjs 临时 `npm install playwright`（已用
+# --no-save，故意不进 package.json）时会落到这里，与 web/ 同理不入库。
+/node_modules/
 web/dist/
 web/.vite/
 web/*.local

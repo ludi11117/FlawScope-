@@ -185,6 +185,66 @@ const run = async () => {
   const resumeDelta = polls - before - hiddenDelta
   check('切回前台后立刻补探一次', resumeDelta >= 1, `恢复后新增 ${resumeDelta} 次`)
 
+  // ---------- 场景 5：就绪但带警告（degraded） ----------
+  //
+  // 对应"知识库为空"这类情况：后端能起来、请求也能成功，但结果会退化。
+  // 此前这条信息只有 API 调用方看得到，界面上一片正常——用户点下"开始诊断"、
+  // 白等一轮 9 次 LLM 调用、拿到一张降级工单，却看不出根因是"库没建"。
+  //
+  // 断言重点是"看得见"：状态灯要变色变文案，诊断页要出横幅，
+  // 而且横幅的文字色与底色**必须不同**（本项目出过"红底红字"的隐形按钮）。
+  console.log('\n[场景 5] 就绪但有警告（知识库为空）')
+  const KB_EMPTY_WARNING =
+    '知识库为空：请先执行 build_knowledge_base.py 构建向量库，否则诊断会因缺少依据而降级'
+  await page.unroute('**/api/health/**')
+  await page.route('**/api/health/live', (r) =>
+    r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'alive', version: '1.3.0' }) }),
+  )
+  await page.route('**/api/health/ready', (r) =>
+    r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ready: true, step: '启动完成', step_index: 6, step_total: 6,
+        elapsed_ms: 900, error: null, warnings: [KB_EMPTY_WARNING], version: '1.3.0',
+      }),
+    }),
+  )
+  await open(page)
+  s = await snapshot(page)
+  check('带警告的就绪状态为 degraded（不能是 up）', s.state === 'degraded', `state=${s.state}`)
+  check('degraded 文案为"服务降级"', s.label === '服务降级', `label=${s.label}`)
+  check('degraded 颜色与就绪不同', s.color !== upColor, `${s.color} vs ${upColor}`)
+  check('degraded 用警示色（warning）', s.color === 'rgb(133, 79, 11)', `color=${s.color}`)
+  check('degraded 的 hover 提示说出了具体原因', (s.title ?? '').includes('build_knowledge_base.py'), `title=${s.title}`)
+
+  const degradedBanner = page.locator('[data-testid="degraded-banner"]')
+  check('诊断页出现降级横幅', (await degradedBanner.count()) > 0)
+  const bannerStyles = await degradedBanner.evaluate((el) => {
+    const cs = getComputedStyle(el)
+    return { bg: cs.backgroundColor, fg: cs.color, border: cs.borderTopColor }
+  })
+  check('降级横幅文字色与底色不同（防"红底红字"这类隐形）',
+    bannerStyles.bg !== bannerStyles.fg, `bg=${bannerStyles.bg} fg=${bannerStyles.fg}`)
+  check('降级横幅底色不是透明的', bannerStyles.bg !== 'rgba(0, 0, 0, 0)', `bg=${bannerStyles.bg}`)
+  const bannerText = (await degradedBanner.textContent()) ?? ''
+  check('横幅里写出了具体警告内容', bannerText.includes('build_knowledge_base.py'),
+    `text=${bannerText.replace(/\s+/g, ' ').trim().slice(0, 80)}`)
+
+  // 关键：degraded **不阻断**诊断。知识库为空时 /diagnose 仍会诚实降级产出工单，
+  // 不让用户试反而是过度反应（状态灯只需要把情况说清楚）。
+  // 注意：开始按钮在 textarea 为空时用 `!input.trim()` 禁用——这是"空输入不能发"，
+  // 不是"降级阻断"。要先填一点内容，才能把"降级不阻断"与"空输入禁用"分开验证。
+  await page.fill('textarea', '那台数控机床主轴一顿一顿，还有怪声')
+  await page.waitForTimeout(200)
+  const degradedBtn = page.locator('button', { hasText: '开始诊断' })
+  check('degraded 不阻断诊断（填了输入后开始按钮可用）',
+    (await degradedBtn.count()) > 0 && !(await degradedBtn.first().isDisabled()),
+    `count=${(await degradedBtn.count())} disabled=${await degradedBtn.first().isDisabled().catch(() => 'N/A')}`)
+  // 文案必须是"开始诊断"，不能是降级后被改成"后端启动中…"或"后端不可达"
+  check('degraded 时开始按钮文案不被改成阻断态', s.label !== '正在启动' && s.label !== '服务不可达')
+  await page.screenshot({ path: 'D:/AgentDiag/_shot_degraded.png', fullPage: false })
+
   await browser.close()
 
   const failed = results.filter((r) => !r.ok)
