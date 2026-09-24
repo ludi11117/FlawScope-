@@ -107,6 +107,77 @@ class TestAbstainStaysInDenominator:
         assert m["coverage_rate_strict"]["abstained"] == 0
 
 
+def _side(judgment=None, hallucinated=None, exclusion_violated=None,
+          unknown_honest=None, false_degraded=None, ok=True):
+    """构造 ablate.summarize 需要的一侧状态（它读的是 `r[side][field]`）。"""
+    return {
+        "judgment": judgment,
+        "hallucinated": hallucinated,
+        "exclusion_violated": exclusion_violated,
+        "unknown_honest": unknown_honest,
+        "false_degraded": false_degraded,
+        "ok": ok,
+    }
+
+
+def _ablate_run(side_state, expect_unknown=False, expected=None):
+    """构造 ablate 的嵌套 record（单/多两侧共用同一状态，够 summarize 用）。"""
+    return {
+        "expect_unknown": expect_unknown,
+        "expected_root_causes": expected or [],
+        "single": dict(side_state),
+        "multi": dict(side_state),
+    }
+
+
+class TestCrossRunSpread:
+    """跨轮摆动：单次运行的差值可能只是噪声，报告要能给出摆动幅度。
+
+    背景：同一份代码、同一批用例重跑，多 Agent 的「是否降级」会翻转
+    （实测 30 个共同用例翻了 5 例，单 Agent 0 例）。所以 `--repeat` 存在的意义
+    不是"跑更多遍让数字好看"，而是给出**区间**——摆动幅度大于差值时，
+    这个差值就不能当成结论。
+    """
+
+    def test_identical_runs_have_zero_spread(self):
+        import ablate_single_vs_multi as ablate
+
+        run = [_ablate_run(_side(judgment=OK), expected=["a"]) for _ in range(4)]
+        spread = ablate.cross_run_spread([run, run], "single")
+        assert spread["coverage_rate"]["spread_pp"] == 0
+        assert spread["coverage_rate"]["mean"] == 1.0
+        assert spread["coverage_rate"]["min"] == spread["coverage_rate"]["max"]
+
+    def test_spread_captures_swing(self):
+        """两轮结论完全相反时，摆动必须是 100pp——这正是「不可只看单次」的证据。"""
+        import ablate_single_vs_multi as ablate
+
+        all_pass = [_ablate_run(_side(judgment=OK), expected=["a"]) for _ in range(4)]
+        all_miss = [_ablate_run(_side(judgment=MISS), expected=["a"]) for _ in range(4)]
+        spread = ablate.cross_run_spread([all_pass, all_miss], "single")
+        assert spread["coverage_rate"]["min"] == 0.0
+        assert spread["coverage_rate"]["max"] == 1.0
+        assert spread["coverage_rate"]["spread_pp"] == 100.0
+
+    def test_metric_with_no_data_reports_none(self):
+        """全轮都判不出该指标时给 None，而不是 0——0 会被读成「表现极差」。"""
+        import ablate_single_vs_multi as ablate
+
+        run = [_ablate_run(_side(judgment=None), expect_unknown=True)]
+        spread = ablate.cross_run_spread([run], "single")
+        assert spread["coverage_rate"]["mean"] is None
+        assert spread["coverage_rate"]["spread_pp"] is None
+
+    def test_spread_covers_every_reported_metric(self):
+        """METRIC_KEYS 是控制台与 Markdown 的单一来源，摆动表必须覆盖全部指标，
+        否则加指标时会出现「报告有、摆动表没有」的静默缺口。"""
+        import ablate_single_vs_multi as ablate
+
+        run = [_ablate_run(_side(judgment=OK), expected=["a"])]
+        spread = ablate.cross_run_spread([run], "single")
+        assert {k for k, _, _ in ablate.METRIC_KEYS} == set(spread.keys())
+
+
 class TestAblationUsesSameDenominatorRule:
     """消融脚本自带一套汇总，口径必须跟 eval_test 对齐——否则两个报告的数字对不上。"""
 
