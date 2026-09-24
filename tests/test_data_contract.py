@@ -111,15 +111,19 @@ def test_plain_paragraph_without_marker_is_not_parsed():
 # ---------- ③ 回归：既有知识库逐条稳定 ----------
 
 def test_existing_knowledge_base_parses_stably():
-    """放宽格式后，现有知识库的解析结果必须与基线一致（104 条 / 34 章节）。
+    """放宽格式后，现有知识库的解析结果必须与基线一致（112 条 / 36 章节）。
 
     这条是防"放宽解析"无意改变既有库的候选集——那会让评估基线无声漂移。
+
+    基准变更记录：2026-09-20 给数控机床、空气压缩机各补了一个「无报警代码」的
+    症状型章节（104→112 条、34→36 章节）。**改数字前先确认是"有意扩库"而不是
+    "解析规则变了"**——后者才是这条测试要抓的回归。
     """
     kb = (BASE_DIR / "data" / "knowledge_base.txt").read_text(encoding="utf-8")
     entries = extract_kb_causes(kb)
-    assert len(entries) == 104, f"既有知识库解析条数变了：{len(entries)}（基线 104）"
+    assert len(entries) == 112, f"既有知识库解析条数变了：{len(entries)}（基线 112）"
     sections = {s for s, _ in entries if s}
-    assert len(sections) == 34, f"章节数变了：{len(sections)}（基线 34）"
+    assert len(sections) == 36, f"章节数变了：{len(sections)}（基线 36）"
 
 
 def test_duplicate_causes_are_deduped():
