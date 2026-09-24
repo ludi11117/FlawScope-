@@ -818,17 +818,28 @@ def test_backfill_total_tokens_from_legacy_rows(temp_db):
 # 实际一次都不走。这个缺陷在图上完全看不出来，只有读提示词才发现。
 
 def test_review_node_passes_evidence_and_fault_to_reviewer(monkeypatch):
-    """审核节点必须把检索资料与报修信息一起交给审核师。
+    """审核节点必须把检索资料、报修信息、知识库分歧一起交给审核师。
 
     这是"审核有牙"的唯一保障：没有对照物，它无法判断诊断里写的原因
-    是否都有出处，也就只能一律放行。
+    是否都有出处，也就只能一律放行。分歧是**最后补上的那块对照物**——
+    库里躺着 36 处"多位师傅判断不一致"，审核师看不到就只能当没有。
     """
     _stub_happy_agents(monkeypatch)
+    # 让检索资料带上「经验分歧」：分歧也必须能流到审核师手上
+    monkeypatch.setattr(
+        orchestrator, "retrieve_evidence",
+        lambda *a, **kw: (
+            "【资料1】\n一、主轴电机报警代码E-203\n"
+            "可能原因：\n1. 轴承损坏\n"
+            "经验分歧：\n- 张师傅认为先查程序最省事。\n- 李师傅坚持先拆轴承。\n"
+        ),
+    )
     captured = {}
 
-    def _spy(diagnosis, evidence="", fault="", correlation_id=None):
+    def _spy(diagnosis, evidence="", fault="", correlation_id=None, disagreements=None):
         captured["evidence"] = evidence
         captured["fault"] = fault
+        captured["disagreements"] = disagreements
         return {"审核意见": "通过", "理由": "有依据", "风险提示": "无"}
 
     monkeypatch.setattr(orchestrator, "agent_review", _spy)
@@ -846,14 +857,22 @@ def test_review_node_passes_evidence_and_fault_to_reviewer(monkeypatch):
     assert "轴承" in captured["evidence"], f"传给审核师的不是真实证据：{captured['evidence']!r}"
     assert captured["fault"], "审核师没拿到报修信息，无法做排除条件检查"
     assert "E-203" in captured["fault"], f"报修信息内容不对：{captured['fault']!r}"
+    assert captured["disagreements"], (
+        "审核师没拿到知识库分歧——分歧就仍然是它的盲区，"
+        "「诊断只取了一派」永远判不出来，辩论也就永远不触发"
+    )
+    assert "李师傅" in str(captured["disagreements"]), "分歧内容没传到审核师手上"
 
 
-def test_review_prompt_declares_four_checks_and_forbids_overreach():
-    """审核提示词必须同时具备：四项可据检查 + 禁止超范围质疑。
+def test_review_prompt_declares_five_checks_and_forbids_overreach():
+    """审核提示词必须同时具备：五项可据检查 + 禁止超范围质疑。
 
     只加检查不加边界，审核师会开始编造驳回理由（"你还没检查液压系统"，
     而资料里压根没有液压内容）；只加边界不加检查，则退回"一律放行"。
     两者必须成对。
+
+    第 5 项（分歧检查）是 2026-09-25 补的：前四项都查不出"诊断只取了知识库
+    两派意见中的一派"，而库里这样的分歧有 36 处，此前完全落在审核师盲区里。
     """
     from prompt_loader import PromptTemplates, render_prompt
 
@@ -864,8 +883,8 @@ def test_review_prompt_declares_four_checks_and_forbids_overreach():
         fault='{"报警代码": "E-203"}',
     )
 
-    # 四项检查
-    for kw in ("越界", "遗漏", "排除", "证据强度"):
+    # 五项检查
+    for kw in ("越界", "遗漏", "排除", "证据强度", "分歧"):
         assert kw in rendered, f"审核提示词缺少「{kw}」检查"
     # 必须把对照物渲染进去，而不是留占位符
     assert "轴承损坏" in rendered, "evidence 没有被渲染进提示词"

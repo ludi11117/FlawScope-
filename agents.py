@@ -899,6 +899,97 @@ def extract_kb_causes(evidence: str) -> list:
     return entries
 
 
+def extract_kb_disagreements(evidence: str) -> list:
+    """从检索片段里抽出「经验分歧」小节，返回 [{"条目": 章节名, "分歧": [条目, ...]}]。
+
+    知识库刻意保留了多位师傅对同一故障的不同判断（见 `docs/为什么必须多Agent.md`）。
+    这些分歧是**辩论的燃料**，但燃料得先被点着——审核师只看诊断结论时，
+    无从知道"这条知识里本来就有两派意见"，于是"诊断只取了一派、把有争议的判断
+    说成定论"永远不会被判不通过，辩论也就永远不触发（实测触发率仅 30–33%，
+    而库里躺着的分歧有 36 处）。
+
+    纯字符串解析、零 LLM：可离线断言，不受判官抖动影响。
+    返回空列表是**正常状态**（该次检索没命中带分歧的条目），调用方不必告警。
+    """
+    out = []
+    section = ""
+    in_disagreement = False
+    current = None
+
+    for raw_line in (evidence or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            # 空行不结束小节：分歧条目之间可能有空行
+            continue
+
+        # 1) 章节标题（`一、主轴电机` / `## 主轴电机` / `## 经验分歧`）
+        hit_section = False
+        for pat in _SECTION_PATTERNS:
+            m = pat.match(line)
+            if not m:
+                continue
+            cand = _strip_md(m.group(1))
+            if cand.startswith("经验分歧"):
+                # 标题本身就是小节名，等价于 `经验分歧：`
+                in_disagreement = True
+                current = {"条目": section, "分歧": []}
+                out.append(current)
+            elif _section_kind(cand) == "":
+                # 新的设备/条目名：切换当前条目，并结束上一段分歧
+                section = cand
+                in_disagreement = False
+                current = None
+            else:
+                in_disagreement = False
+                current = None
+            hit_section = True
+            break
+        if hit_section:
+            continue
+
+        # 2) 分歧段内的列表条目。**必须排在键名行之前**：`- 两人一致的地方：xxx`
+        #    既是列表条目、又满足键名行的形态（首字段 ≤12 字且不含冒号），
+        #    而它显然是条目。让键名行先判会把这类条目整条吞掉。
+        if in_disagreement and current is not None:
+            lm = _LIST_ENTRY.match(line)
+            if lm:
+                current["分歧"].append(_strip_md(lm.group(1)))
+                continue
+
+        # 3) 键名行：`经验分歧：` 进入分歧段；其它已知小节结束它
+        m = _KEYED_LINE.match(line)
+        if m:
+            key = _strip_md(m.group(1))
+            rest = _strip_md(m.group(2))
+            if key.startswith("经验分歧"):
+                in_disagreement = True
+                current = {"条目": section, "分歧": []}
+                out.append(current)
+                if rest:
+                    current["分歧"].append(rest)
+            elif _section_kind(key):
+                in_disagreement = False
+                current = None
+            continue
+
+    return [d for d in out if d["分歧"]]
+
+
+def _format_disagreements(disagreements: list) -> str:
+    """把分歧渲染成给审核师看的清单。
+
+    空时给一句**明确的"未发现"**，而不是留空——留空与"模板没渲染上"
+    在提示词里长得一样，审核师会分不清"这次真没有"和"系统没查"。
+    """
+    if not disagreements:
+        return "（本次检索命中的资料中未发现经验分歧）"
+    lines = []
+    for d in disagreements:
+        lines.append(f"- 关于「{d.get('条目') or '未标条目'}」：")
+        lines.extend(f"  · {x}" for x in d.get("分歧", []))
+    return "\n".join(lines)
+
+
 # 知识库健康阈值：低于此值说明"换进来的数据格式没被正确解析"。
 # 取值依据：本项目现有知识库解析出 104 条；真实资料即使只写三五台设备，
 # 也应在数十条量级。低于 1 条就是明确的格式故障，必须报出来。
@@ -1163,7 +1254,7 @@ def agent_diagnose(evidence: str, fault: str, exclusion_list: list = None, corre
 
 
 def agent_review(diagnosis: dict, evidence: str = "", fault: str = "",
-                 correlation_id: str = None) -> dict:
+                 correlation_id: str = None, disagreements: list = None) -> dict:
     """独立审核诊断结论。
 
     evidence / fault 是审核师**必要的对照物**：没有它们，审核师只能看诊断
@@ -1173,12 +1264,19 @@ def agent_review(diagnosis: dict, evidence: str = "", fault: str = "",
 
     两个参数给默认值而非必填：历史调用点（以及测试里的桩）可能只传 diagnosis，
     缺参数时退化为"无对照物"的旧行为，而不是直接抛 TypeError。
+
+    `disagreements` 是**知识库里的经验分歧**（多位师傅对同一故障的不同判断），
+    不传时从 evidence 现算。它是审核清单第 5 项的靶子：没有它，审核师看不到
+    "这条知识本来就有两派意见"，只会照着诊断的自洽性放行。
     """
+    if disagreements is None:
+        disagreements = extract_kb_disagreements(evidence)
     prompt = render_prompt(
         PromptTemplates.AGENT_REVIEW,
         diagnosis=json.dumps(diagnosis, ensure_ascii=False, indent=2),
         evidence=evidence or "（未提供检索资料）",
         fault=fault or "（未提供原始报修信息）",
+        disagreements=_format_disagreements(disagreements),
     )
     messages = [
         SystemMessage(content="你是严格的维修安全审核员，职责是挑战结论而非确认结论。"),

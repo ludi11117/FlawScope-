@@ -9,7 +9,7 @@ from agents import (
     agent_cost, agent_workorder, agent_rebuttal, agent_review_final,
     extract_fault_info, is_info_sufficient, generate_followup_question,
     extract_image_info, check_relevance, is_equipment_in_evidence,
-    build_degraded_report, find_cross_device_hints,
+    build_degraded_report, find_cross_device_hints, extract_kb_disagreements,
     DEGRADED_REASON_NO_HIT, DEGRADED_REASON_EQUIPMENT_MISMATCH,
     DEGRADED_REASON_IRRELEVANT, DEGRADED_REASON_RELEVANCE_UNKNOWN,
     DEGRADED_REASON_LLM_FAILED,
@@ -298,17 +298,31 @@ def diagnose_node(state: AgentState) -> AgentState:
 
 
 def review_node(state: AgentState) -> AgentState:
-    """审核节点：把检索资料和原始报修一起交给审核师，让它有对照物可查。
+    """审核节点：把检索资料、原始报修、知识库分歧一起交给审核师，让它有对照物可查。
 
     只传 diagnosis 的话，审核师无法判断"诊断里写的原因是否都有出处"，
     只能确认结论内部自洽——而诊断提示词强制写满知识库全部原因，
     于是审核恒通过、辩论永不触发。传资料是让辩论真正能触发的前提。
+
+    传 `disagreements` 补上最后一块对照物：知识库里本来就有 36 处"多位师傅
+    判断不一致"，但审核师此前看不到，也就永远发现不了"诊断只取了一派"。
+    这是「冲突材料是多 Agent 辩论的存在理由」在代码里的落点。
     """
+    evidence = state.get("evidence", "")
+    disagreements = extract_kb_disagreements(evidence)
+    if disagreements:
+        logger.info(
+            "review_kb_disagreements",
+            count=len(disagreements),
+            entries=[d.get("条目") for d in disagreements],
+            correlation_id=state["correlation_id"],
+        )
     review = agent_review(
         state["diagnosis"],
-        evidence=state.get("evidence", ""),
+        evidence=evidence,
         fault=json.dumps(state.get("fault_info", {}), ensure_ascii=False, indent=2),
         correlation_id=state["correlation_id"],
+        disagreements=disagreements,
     )
     if not review:
         logger.error("review_llm_failed", correlation_id=state["correlation_id"])
