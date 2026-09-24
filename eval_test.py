@@ -427,6 +427,19 @@ def aggregate(records: list) -> dict:
                           "rate": (core_ok / len(judged)) if judged else None},
         "coverage_rate": {"pass": coverage_ok, "total": len(judged),
                           "rate": (coverage_ok / len(judged)) if judged else None},
+        # 严格口径：把「弃权」留在分母里。
+        #
+        # 现行 coverage_rate 的分母是 len(judged)，而降级样本的 judgment 是 None
+        # （没有根因可判），于是**每弃权一例，分母就少一** —— 多降级反而让覆盖率
+        # 更好看。实测 2026-09-25：多 Agent 25/27 = 92.6%，单 Agent 27/30 = 90.0%，
+        # 看着是多 Agent 更优；但多 Agent 通过的**绝对例数更少**（25 < 27），
+        # 按同一个分母算 25/30 = 83.3%，反而低 6.7pp。
+        #
+        # 「没测到」不能冒充「测得好」：降级是弃权，不是通过。两个口径必须一起报。
+        "coverage_rate_strict": {"pass": coverage_ok, "total": len(known_with_expected),
+                                 "abstained": len(known_with_expected) - len(judged),
+                                 "rate": (coverage_ok / len(known_with_expected))
+                                 if known_with_expected else None},
         "hallucination_rate": {"bad": halluc_bad, "total": len(halluc_eval),
                                "rate": (halluc_bad / len(halluc_eval)) if halluc_eval else None},
         "exclusion_compliance": {"violated": excl_bad, "total": len(excl_cases),
@@ -496,6 +509,7 @@ def build_markdown(meta: dict, metrics: dict, debate: dict, records: list) -> st
     lines.append("|---|---|---|---|")
     lines.append(f"| ① 终诊根因·核心一致率 | {m['core_accuracy']['pass']}/{m['core_accuracy']['total']} | {format_rate(m['core_accuracy']['rate'])} | 判官评估，命中至少一条黄金根因 |")
     lines.append(f"| ② 终诊根因·全覆盖率 | {m['coverage_rate']['pass']}/{m['coverage_rate']['total']} | {format_rate(m['coverage_rate']['rate'])} | 判官评估，覆盖全部黄金根因（严格） |")
+    lines.append(f"| ②b 全覆盖率·严格口径 | {m['coverage_rate_strict']['pass']}/{m['coverage_rate_strict']['total']} | {format_rate(m['coverage_rate_strict']['rate'])} | **弃权（降级）留在分母**：没测到 ≠ 测得好 |")
     lines.append(f"| ③ 幻觉率 | {m['hallucination_rate']['bad']}/{m['hallucination_rate']['total']} | {format_rate(m['hallucination_rate']['rate'])} | 程序化检测，终诊引用了**本次检索片段之外**原因的比例（严格溯源） |")
     lines.append(f"| ④ 排除条件遵守率 | {m['exclusion_compliance']['violated']}/{m['exclusion_compliance']['total']} 违规 | {format_rate(m['exclusion_compliance']['rate'])} | 程序化检测，被排除原因不得泄漏进终诊 |")
     lines.append(f"| ⑤ 完整输出率 | {m['completeness']['ok']}/{m['completeness']['total']} | {format_rate(m['completeness']['rate'])} | 诊断/审核/成本/工单各节点均产出有效结构 |")
@@ -557,7 +571,10 @@ def build_markdown(meta: dict, metrics: dict, debate: dict, records: list) -> st
     if not any(r.get("snapshot_diff", {}).get("status") == "changed" for r in records):
         lines.append("（无变更）")
     lines.append("")
-    lines.append("*注：判官核心一致率与全覆盖率分母为有效地判案例数；辩论触发后终诊以最终根因为准，可能由多条收敛为一条，因此全覆盖率偏严格。*")
+    lines.append("*注：判官核心一致率与全覆盖率的分母是**判官实际判过的**案例数。降级样本没有根因可判"
+                 "（`judgment` 为 `None`），会被默认口径整个剔出分母——于是**弃权越多、百分比越好看**。"
+                 "所以另给「②b 严格口径」把弃权留在分母里，两个口径必须一起报。"
+                 "另外辩论触发后终诊以最终根因为准，可能由多条收敛为一条，全覆盖率本身已偏严格。*")
     return "\n".join(lines)
 
 
@@ -569,6 +586,7 @@ def print_console_summary(metrics: dict, debate: dict):
     print("-" * 72)
     print(f"① 终诊根因·核心一致率     {m['core_accuracy']['pass']}/{m['core_accuracy']['total']}  {format_rate(m['core_accuracy']['rate'])}")
     print(f"② 终诊根因·全覆盖率       {m['coverage_rate']['pass']}/{m['coverage_rate']['total']}  {format_rate(m['coverage_rate']['rate'])}   ← 严格标准")
+    print(f"②b 全覆盖率·严格口径      {m['coverage_rate_strict']['pass']}/{m['coverage_rate_strict']['total']}  {format_rate(m['coverage_rate_strict']['rate'])}   ← 弃权留在分母")
     print(f"③ 幻觉率                 {m['hallucination_rate']['bad']}/{m['hallucination_rate']['total']}  {format_rate(m['hallucination_rate']['rate'])}")
     print(f"④ 排除条件遵守率          {m['exclusion_compliance']['violated']}/{m['exclusion_compliance']['total']} 违规  {format_rate(m['exclusion_compliance']['rate'])}")
     print(f"⑤ 完整输出率              {m['completeness']['ok']}/{m['completeness']['total']}  {format_rate(m['completeness']['rate'])}")

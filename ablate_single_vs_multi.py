@@ -34,14 +34,26 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-
 import eval_test  # noqa: E402
 from agents import agent_diagnose, extract_fault_info, retrieve_evidence  # noqa: E402
 from orchestrator import run_diagnosis  # noqa: E402
 
 BASE_DIR = Path(__file__).resolve().parent
 OUT_DIR = BASE_DIR / "eval_reports"
+
+
+def _force_utf8_stdout() -> None:
+    """把 stdout 换成 UTF-8。**只能在 main() 里调用，不能放模块级。**
+
+    放模块级会让 import 也带副作用：pytest 捕获输出时已经替换过 sys.stdout，
+    这里再往 `sys.stdout.buffer` 上套一层 TextIOWrapper，就把 pytest 的捕获流
+    套住了，teardown 阶段报 "I/O operation on closed file"——只要测试里
+    import 这个模块就会中招，而报错位置在 pytest 内部，极难定位。
+    """
+    enc = (getattr(sys.stdout, "encoding", "") or "").lower()
+    if enc.startswith("utf-8"):
+        return
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 
 def build_single_query(fault_text: str, fault_info: dict) -> str:
@@ -171,6 +183,12 @@ def summarize(records: list, side: str) -> dict:
         "call_failures": failed,
         "core_accuracy": {"pass": core_ok, "total": len(judged), "rate": rate(core_ok, len(judged))},
         "coverage_rate": {"pass": coverage_ok, "total": len(judged), "rate": rate(coverage_ok, len(judged))},
+        # 严格口径：弃权（有依据却降级）留在分母里。
+        # 现行口径的分母 len(judged) 会把降级样本整个剔出去，于是多降级 = 分母变小
+        # = 覆盖率更高。两侧分母不同时，百分比根本不可比（详见 eval_test.aggregate 同名项）。
+        "coverage_rate_strict": {"pass": coverage_ok, "total": len(known),
+                                 "abstained": len(known) - len(judged),
+                                 "rate": rate(coverage_ok, len(known))},
         "hallucination_rate": {"bad": halluc_bad, "total": len(halluc), "rate": rate(halluc_bad, len(halluc))},
         "exclusion_compliance": {"violated": excl_bad, "total": len(excl),
                                  "rate": rate(len(excl) - excl_bad, len(excl))},
@@ -197,13 +215,19 @@ def build_markdown(meta: dict, single: dict, multi: dict, records: list) -> str:
     L.append("")
     L.append("## 口径说明（可比性前提）\n")
     L.append("两侧使用 test/eval 的**同一套**判定函数；单 Agent 与多 Agent 共用同一次检索的 evidence。")
-    L.append("单 Agent 调用失败计为失败，不从分母剔除。\n")
+    L.append("单 Agent 调用失败计为失败，不从分母剔除。")
+    L.append("")
+    L.append("⚠️ **「全覆盖率」有两个口径，必须一起看。** 默认口径的分母是「判官实际判过的用例」")
+    L.append("（`len(judged)`），而降级样本没有根因可判、`judgment` 为 `None`，于是**每弃权一例，")
+    L.append("分母就少一** —— 多降级反而让覆盖率更好看。严格口径把弃权留在分母里。")
+    L.append("两侧弃权数不同时，两个口径会给出**相反的结论**，所以并列展示。\n")
     L.append("## 指标对照\n")
     L.append("| 指标 | 单 Agent | 多 Agent | 差值 | 说明 |")
     L.append("|---|---|---|---|---|")
     rows = [
         ("core_accuracy", "核心一致率", "LLM 判官：根因是否抓对主因"),
-        ("coverage_rate", "全覆盖率", "LLM 判官：是否覆盖全部期望根因"),
+        ("coverage_rate", "全覆盖率", "LLM 判官：是否覆盖全部期望根因（分母 = 判官判过的用例）"),
+        ("coverage_rate_strict", "全覆盖率·严格", "同上，但**弃权留在分母**（没测到 ≠ 测得好）"),
         ("hallucination_rate", "幻觉率", "程序化：引用检索片段之外的根因（越低越好）"),
         ("exclusion_compliance", "排除遵守率", "程序化：未泄漏被排除原因（越高越好）"),
         ("honest_degradation", "诚实降级率", "知识库外用例题是否正确降级"),
@@ -220,6 +244,9 @@ def build_markdown(meta: dict, single: dict, multi: dict, records: list) -> str:
     L.append("")
     L.append(f"- 单 Agent 调用失败：{single['call_failures']} / {single['total']}")
     L.append(f"- 多 Agent 调用失败：{multi['call_failures']} / {multi['total']}")
+    L.append(f"- 弃权（降级，被默认口径剔出分母）：单 Agent "
+             f"{single['coverage_rate_strict']['abstained']} 例 / 多 Agent "
+             f"{multi['coverage_rate_strict']['abstained']} 例")
     L.append("")
     L.append("## 逐用例对照\n")
     L.append("| 用例 | 类型 | 单 Agent 结论 | 单判定 | 多 Agent 结论 | 多判定 | 辩论轮 |")
@@ -249,6 +276,7 @@ def mark(scored: dict) -> str:
 
 
 def main():
+    _force_utf8_stdout()
     ap = argparse.ArgumentParser(description="单 Agent vs 多 Agent 消融实验")
     ap.add_argument("--cases", default=str(BASE_DIR / "test_cases.json"))
     ap.add_argument("--limit", type=int, default=0)
@@ -314,6 +342,7 @@ def main():
     print("▶ 指标对照")
     print("-" * 88)
     for key, name in [("core_accuracy", "核心一致率"), ("coverage_rate", "全覆盖率"),
+                      ("coverage_rate_strict", "全覆盖率·严格"),
                       ("hallucination_rate", "幻觉率"), ("exclusion_compliance", "排除遵守率"),
                       ("honest_degradation", "诚实降级率"), ("false_degradation", "误降级率")]:
         s = (single[key] or {}).get("rate")
@@ -321,6 +350,8 @@ def main():
         d = f"{(m_ - s) * 100:+.0f}pp" if (s is not None and m_ is not None) else "n/a"
         print(f"  {name:<12} 单 {fmt(single, key):>5}   多 {fmt(multi, key):>5}   {d}")
     print("-" * 88)
+    print(f"  弃权(降级，被默认口径剔出分母) 单 {single['coverage_rate_strict']['abstained']}"
+          f" | 多 {multi['coverage_rate_strict']['abstained']}")
     print(f"  单 Agent 调用失败 {single['call_failures']}/{single['total']}"
           f" | 多 Agent 调用失败 {multi['call_failures']}/{multi['total']}")
     print(f"  耗时 {time.perf_counter() - t_start:.0f}s")
