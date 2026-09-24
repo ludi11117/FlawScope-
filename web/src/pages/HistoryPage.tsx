@@ -530,7 +530,11 @@ function RecordRow({
               }}
             >
               ⚠ {wo.风险等级}
-              {wo.风险说明 && <div style={{ marginTop: 3 }}>{wo.风险说明}</div>}
+              {/* pre-line：风险说明含多行（降级时附"参考方向"的逐条排查动作），
+                  不设的话换行会被折叠成空格 */}
+              {wo.风险说明 && (
+                <div style={{ marginTop: 3, whiteSpace: 'pre-line' }}>{wo.风险说明}</div>
+              )}
             </div>
           )}
 

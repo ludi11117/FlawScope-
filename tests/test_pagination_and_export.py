@@ -203,6 +203,34 @@ def test_workorder_markdown_does_not_invent_sections_for_degraded_order():
         assert f"## {heading}" not in md
 
 
+def test_degraded_note_keeps_every_line_inside_blockquote():
+    """多行风险说明的**每一行**都得留在引用块里。
+
+    降级工单会附"参考方向"的逐条排查动作（降级报告里是换行拼的）。只给首行
+    加 `> ` 前缀的话，后续行会跳出引用块，整段 markdown 结构就散了。
+
+    判别式：除标题外每一行都必须以 `>` 开头——退化回"只加一次前缀"时这里会红。
+    """
+    degraded = {
+        "工单编号": "WO-abc12345",
+        "风险等级": "待人工确认（知识库无依据）",
+        "风险说明": (
+            "知识库未收录「注塑机」。可尝试：补充案例到 data/raw/ 后重建。\n"
+            "以下排查动作来自「冷水机组」——非本设备根因，执行前请现场确认\n"
+            "- 停机后手动盘车\n"
+            "- 检查润滑脂状态"
+        ),
+    }
+    md = workorder_export.workorder_to_markdown(degraded)
+
+    assert "- 停机后手动盘车" in md
+    assert "- 检查润滑脂状态" in md
+    for line in md.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        assert line.startswith(">"), f"这行跳出了引用块: {line!r}"
+
+
 def test_workorder_markdown_survives_empty_and_malformed_input():
     """导出接口不该因为"这轮没出工单"而 500。"""
     assert "未生成工单" in workorder_export.workorder_to_markdown({})

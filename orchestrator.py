@@ -9,7 +9,7 @@ from agents import (
     agent_cost, agent_workorder, agent_rebuttal, agent_review_final,
     extract_fault_info, is_info_sufficient, generate_followup_question,
     extract_image_info, check_relevance, is_equipment_in_evidence,
-    build_degraded_report,
+    build_degraded_report, find_cross_device_hints,
     DEGRADED_REASON_NO_HIT, DEGRADED_REASON_EQUIPMENT_MISMATCH,
     DEGRADED_REASON_IRRELEVANT, DEGRADED_REASON_RELEVANCE_UNKNOWN,
     DEGRADED_REASON_LLM_FAILED,
@@ -204,7 +204,10 @@ def diagnose_node(state: AgentState) -> AgentState:
 
     if "【知识库无相关依据】" in evidence:
         logger.warning("diagnose_degraded_no_evidence", correlation_id=state["correlation_id"])
-        report = build_degraded_report(fault_info, DEGRADED_REASON_NO_HIT)
+        report = build_degraded_report(
+            fault_info, DEGRADED_REASON_NO_HIT,
+            cross_device_hints=find_cross_device_hints(fault_info),
+        )
         return {
             "diagnosis": {
                 "报警代码": "N/A",
@@ -212,6 +215,7 @@ def diagnose_node(state: AgentState) -> AgentState:
                 "依据": "无",
                 "排查建议": report["下一步建议"],
                 "降级说明": report["判定说明"],
+                "参考方向": report["参考方向"],
             },
             "status": "insufficient_knowledge"
         }
@@ -219,7 +223,10 @@ def diagnose_node(state: AgentState) -> AgentState:
     # 确定性护栏：设备类型/报警代码不在资料中 → 跨设备幻觉，直接降级
     if not is_equipment_in_evidence(fault_info, evidence):
         logger.warning("diagnose_degraded_equipment_mismatch", correlation_id=state["correlation_id"])
-        report = build_degraded_report(fault_info, DEGRADED_REASON_EQUIPMENT_MISMATCH)
+        report = build_degraded_report(
+            fault_info, DEGRADED_REASON_EQUIPMENT_MISMATCH,
+            cross_device_hints=find_cross_device_hints(fault_info),
+        )
         return {
             "diagnosis": {
                 "报警代码": "N/A",
@@ -227,6 +234,7 @@ def diagnose_node(state: AgentState) -> AgentState:
                 "依据": "无",
                 "排查建议": report["下一步建议"],
                 "降级说明": report["判定说明"],
+                "参考方向": report["参考方向"],
             },
             "status": "insufficient_knowledge"
         }
@@ -235,7 +243,10 @@ def diagnose_node(state: AgentState) -> AgentState:
     relevance = check_relevance(state["user_input"], evidence, correlation_id=state["correlation_id"])
     if relevance is False:
         logger.warning("diagnose_degraded_irrelevant", correlation_id=state["correlation_id"])
-        report = build_degraded_report(fault_info, DEGRADED_REASON_IRRELEVANT)
+        report = build_degraded_report(
+            fault_info, DEGRADED_REASON_IRRELEVANT,
+            cross_device_hints=find_cross_device_hints(fault_info),
+        )
         return {
             "diagnosis": {
                 "报警代码": "N/A",
@@ -243,6 +254,7 @@ def diagnose_node(state: AgentState) -> AgentState:
                 "依据": "无",
                 "排查建议": report["下一步建议"],
                 "降级说明": report["判定说明"],
+                "参考方向": report["参考方向"],
             },
             "status": "insufficient_knowledge"
         }
@@ -407,8 +419,8 @@ def cost_node(state: AgentState) -> AgentState:
     return {"cost": cost, "status": "costed"}
 
 
-def _compose_risk_note(head: str, degraded_note: str, tips: list) -> str:
-    """把「降级原因 + 判定说明 + 下一步建议」拼成一段可读的风险说明。
+def _compose_risk_note(head: str, degraded_note: str, tips: list, references: list = None) -> str:
+    """把「降级原因 + 判定说明 + 下一步建议 + 参考方向」拼成一段可读的风险说明。
 
     降级工单本来就只有「工单编号 / 风险等级 / 风险说明」三样（硬约束 20），
     所以往风险说明里补具体内容**不违反**"不得补出空的维修方案"——这里补的是
@@ -419,7 +431,11 @@ def _compose_risk_note(head: str, degraded_note: str, tips: list) -> str:
         parts.append(degraded_note.rstrip("。"))
     if tips:
         parts.append("可尝试：" + "；".join(str(t) for t in tips))
-    return "。".join(parts) + "。"
+    note = "。".join(parts) + "。"
+    if references:
+        # 参考方向自带完整句式（含"非本设备根因"的免责说明），单独成段更醒目
+        note += "\n" + "\n".join(references)
+    return note
 
 
 def workorder_node(state: AgentState) -> AgentState:
@@ -457,12 +473,15 @@ def workorder_node(state: AgentState) -> AgentState:
     diag = _effective_diagnosis(state)
     degraded_note = (diag.get("降级说明") or "").strip()
     tips = diag.get("排查建议") or []
+    references = diag.get("参考方向") or []
 
-    # 知识库无依据直接降级时，同样标记
+    # 知识库无依据直接降级时，同样标记。
+    # 状态语义不变（仍是"待人工确认"——本设备确实没有依据），但附上了跨设备的
+    # 排查动作作为参考，人工介入时不再是两手空空。
     if status == "insufficient_knowledge":
         workorder["风险等级"] = "待人工确认（知识库无依据）"
         workorder["风险说明"] = _compose_risk_note(
-            "知识库未覆盖该故障的相关依据，无法自动诊断", degraded_note, tips)
+            "知识库未覆盖该故障的相关依据，无法自动诊断", degraded_note, tips, references)
     elif status == "llm_failed":
         workorder["风险等级"] = "待人工确认（模型服务异常）"
         workorder["风险说明"] = _compose_risk_note(

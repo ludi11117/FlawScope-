@@ -1294,10 +1294,91 @@ DEGRADED_REASON_RELEVANCE_UNKNOWN = "relevance_unknown"
 DEGRADED_REASON_LLM_FAILED = "llm_failed"
 
 
+# 参考方向里出现的设备名都带这层前缀，明确它不是本设备的结论。
+_CROSS_DEVICE_DISCLAIMER = "非本设备根因，执行前请现场确认"
+
+
+def _extract_check_actions(evidence: str) -> list:
+    """从检索片段中抽出『排查建议』小节下的动作条目（`- xxx`）。
+
+    只收**动作**、不收**可能原因**：排查动作跨设备通用——"检查润滑脂状态"
+    在哪台设备上都是个安全的检查动作；而"可能原因"是别的设备得出的根因结论，
+    照搬到本台设备就是编造（硬约束 4）。这是参考方向能给的边界。
+    """
+    actions = []
+    in_advice = False
+    for line in (evidence or "").splitlines():
+        s = line.strip()
+        if re.match(r"^排查建议\s*[:：]", s):
+            in_advice = True
+            continue
+        if in_advice:
+            # 撞上下一个小节标题就退出；空行不退出（小节内可能有换行）
+            if re.match(r"^(故障现象|可能原因|经验分歧|设备类型|报警代码)\s*[:：]", s):
+                in_advice = False
+                continue
+            m = re.match(r"^[-*•]\s*(.+)$", s)
+            if m:
+                actions.append(m.group(1).strip())
+    return actions
+
+
+# 标注来源时优先认**设备**而不是**部件**——「主轴」是部件，说"来自主轴条目"
+# 不如"来自数控机床条目"清楚。这里只是给 EQUIPMENT_SYNONYMS 的 key 排优先级，
+# 不是第二份副本：认不出时仍回退到遍历全表，所以新增设备不会静默失效。
+_DEVICE_HINT_PRIORITY = (
+    "空气压缩机", "数控机床", "工业机器人", "伺服驱动器",
+    "冷水机组", "布袋除尘器", "输送带", "液压系统", "气动系统",
+)
+
+
+def _device_hint_of(text: str) -> str:
+    """在片段里认出一个已知设备名，用于标注参考方向的来源。认不出返回空串。"""
+    for name in _DEVICE_HINT_PRIORITY:
+        if name in text or any(a in text for a in EQUIPMENT_SYNONYMS.get(name, ())):
+            return name
+    # 退而求其次：认出部件名（如「主轴」）也比完全不标来源强
+    for canonical, aliases in EQUIPMENT_SYNONYMS.items():
+        if canonical in text or any(a in text for a in aliases):
+            return canonical
+    return ""
+
+
+def find_cross_device_hints(fault_info: dict, k: int = 4, evidence: str = None) -> list:
+    """降级时找"同类症状在其它设备上的排查动作"，给用户一个可执行的参考方向。
+
+    检索时**刻意不带设备名**——带上就又会命中不到（本设备本来就不在库里），
+    只剩症状词才能横向命中其它设备的同症状条目。
+
+    `evidence` 可注入，供测试离线驱动（真实检索要调 embedding）。
+
+    返回 [{"设备": str, "动作": str}]；找不到返回 []。
+    """
+    symptoms = (fault_info or {}).get("故障现象") or []
+    if not symptoms:
+        return []
+
+    query = " ".join(str(s) for s in symptoms)
+    if evidence is None:
+        try:
+            evidence = retrieve_evidence(query, k=k)
+        except Exception as e:  # noqa: BLE001
+            # 二次检索失败绝不能把降级路径本身带崩：拿不到参考方向就当没有，
+            # 判定说明与下一步建议照常产出。降级是最后一道防线，它自己必须最结实。
+            logger.warning("cross_device_hints_retrieve_failed", error=str(e))
+            return []
+    if "【知识库无相关依据】" in evidence:
+        return []
+
+    device = _device_hint_of(evidence)
+    return [{"设备": device, "动作": a} for a in _extract_check_actions(evidence)]
+
+
 def build_degraded_report(
     fault_info: dict,
     degraded_reason: str,
     kb_size: int = None,
+    cross_device_hints: list = None,
 ) -> dict:
     """降级时生成可用的补充信息：判定说明 + 下一步建议。**纯函数，零 LLM 调用。**
 
@@ -1362,7 +1443,22 @@ def build_degraded_report(
         verdict = "未能自动诊断"
         next_steps = ["建议人工介入"]
 
-    return {"判定说明": verdict, "下一步建议": next_steps}
+    # 参考方向：同类症状在**其它设备**上的排查动作。
+    # 只给动作、不给根因；且必须写明它不是本设备的结论——否则操作工可能
+    # 照着别的设备的排查路径去拆手头这台机器。
+    references = []
+    if cross_device_hints:
+        src = cross_device_hints[0].get("设备") or "知识库中同类症状的其它设备"
+        references.append(
+            f"以下排查动作来自知识库中「{src}」的同类症状条目——{_CROSS_DEVICE_DISCLAIMER}"
+        )
+        references.extend(f"- {h['动作']}" for h in cross_device_hints[:3])
+
+    return {
+        "判定说明": verdict,
+        "下一步建议": next_steps,
+        "参考方向": references,
+    }
 
 
 def restore_dropped_candidates(initial_root: str, final_root: str, excluded_causes: list = None,

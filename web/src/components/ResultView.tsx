@@ -487,7 +487,18 @@ export function ResultView({ result }: Props) {
               <div>
                 {wo.风险等级}
                 {wo.风险说明 && (
-                  <div style={{ fontWeight: 400, marginTop: 4, lineHeight: 1.6 }}>{wo.风险说明}</div>
+                  // pre-line：风险说明是**多行**文本（降级时会带"参考方向"的
+                  // 逐条排查动作）。不设的话换行会被 HTML 折叠成空格，几条动作挤成一坨。
+                  <div
+                    style={{
+                      fontWeight: 400,
+                      marginTop: 4,
+                      lineHeight: 1.6,
+                      whiteSpace: 'pre-line',
+                    }}
+                  >
+                    {wo.风险说明}
+                  </div>
                 )}
               </div>
             </div>

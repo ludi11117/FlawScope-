@@ -84,7 +84,11 @@ def workorder_to_markdown(
         lines.append(f"> **风险等级：{risk}**")
         note = _as_text(workorder.get("风险说明"))
         if note:
-            lines.append(f">\n> {note}")
+            # 风险说明可能是**多行**（降级时会附"参考方向"的逐条排查动作）。
+            # 每一行都得带 `> ` 前缀，否则后续行会跳出引用块、破坏整段结构——
+            # 只给头部加一次前缀在多行时是不够的。
+            lines.append(">")
+            lines.extend(f"> {ln}" if ln.strip() else ">" for ln in note.splitlines())
 
     for heading, key in _SECTIONS:
         text = _as_text(workorder.get(key))
