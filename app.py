@@ -11,6 +11,7 @@ from database import (
     get_records, count_records, get_distinct_statuses, get_stats, save_diagnosis_record
 )
 from logging_config import configure_logging
+from status_meta import status_meta
 from workorder_export import workorder_to_markdown, workorder_filename
 
 # Streamlit 进程此前从不调用 configure_logging()，走的是 structlog 默认配置：
@@ -194,14 +195,17 @@ def render_diagnosis():
         st.markdown("## 诊断结果")
 
         status = result.get("status", "")
-        if status == "pending_human_review":
-            st.error("⚠️ 系统无法自动解决冲突，已转人工审核")
-        elif status == "llm_failed":
-            st.error("⚠️ 模型服务调用失败，本轮诊断未完成，请稍后重试")
-        elif status == "done":
-            st.success("✅ 诊断流程完成，工单已生成")
-        elif status == "insufficient_knowledge":
-            st.warning("⚠️ 知识库无相关依据，建议人工介入")
+        # 状态文案与级别都取自 status_meta（唯一来源）。
+        # 此前这里是 if/elif 硬编码四条：加一个状态就得记得回来补一条，
+        # 漏了就"什么都不显示"——不报错，但用户不知道发生了什么。
+        _banner = status_meta(status)
+        if _banner.banner:
+            {
+                "error": st.error,
+                "warning": st.warning,
+                "success": st.success,
+                "info": st.info,
+            }.get(_banner.level, st.info)(_banner.banner)
 
         # Token 使用统计
         if result.get("token_usage"):
@@ -398,15 +402,9 @@ def render_history():
             root_cause = (diagnosis.get("根因判断") or workorder.get("根因") or "无")[:40]
             created = (r.get("created_at") or "")[:19]
 
-            # 状态颜色
+            # 状态颜色（取自 status_meta 的唯一来源，不再各自维护一份字典）
             status = r.get("status", "")
-            status_color = {
-                "done": "🟢",
-                "insufficient_knowledge": "🟡",
-                "pending_human_review": "🔴",
-                "llm_failed": "🔴",
-                "need_more_info": "🔵",
-            }.get(status, "⚪")
+            status_color = status_meta(status).icon
 
             title = f"{status_color} [ID {r.get('id')}] {created} ｜ {wo_id} ｜ {status}"
             with st.expander(title):

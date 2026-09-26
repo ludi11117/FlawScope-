@@ -20,9 +20,11 @@ from agents import (
     get_llm,
     get_embeddings,
     get_knowledge_base_size,
+    _init_bm25,
 )
 from config import settings
 from logging_config import get_logger, configure_logging
+from status_meta import STATUS_META, should_persist
 from workorder_export import workorder_to_markdown, workorder_filename
 from startup_status import (
     set_step,
@@ -39,8 +41,14 @@ logger = get_logger(__name__)
 # 而这种不一致在"探活只返回 200 就算过"的部署脚本里根本看不出来。
 API_VERSION = "1.3.0"
 
-# 健康检查结果缓存（TTL 由 settings.HEALTH_CACHE_TTL 控制）
+# 健康检查结果缓存（TTL 由 settings.HEALTH_CACHE_TTL 控制）。
+#
+# 加锁的理由不只是"字典并发不安全"：裸 dict 的经典 bug 是**缓存击穿** ——
+# 并发调用同时读到 payload is None，于是各自真探一次（一次真探 = 1 次 LLM
+# + 1 次 Embedding）。探活本来就是高频动作，几个人同时刷就等于配额翻倍。
+# 持锁做"判断 + 真探 + 写回"让同一时刻只有一个线程真探，其余等结果。
 _health_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
+_health_cache_lock = threading.Lock()
 
 # 并发诊断闸门。一次诊断要串行发起 6~9 次 LLM 调用、耗时数十秒；不限并发的话
 # 突发流量会占满 FastAPI 的线程池（连 /health 都得排队），并把模型配额成倍烧掉。
@@ -98,10 +106,15 @@ async def lifespan(app: FastAPI):
     steps = [
         ("加载日志配置", configure_logging),
         ("初始化数据库", init_db),
-        # 这三步是真正的耗时项：向量库要读盘，BM25 要全库分词
+        # 这几步是真正的耗时项：向量库要读盘，检索索引要全库分词
         ("加载模型客户端", get_llm),
         ("加载嵌入模型", get_embeddings),
         ("加载向量库", get_chroma_db),
+        # 构建检索索引（BM25）。此前它是**首次检索时懒建**的：`/health/ready` 已经
+        # 宣告就绪，用户点下诊断却要先等建索引（实测 retrieve 节点 2.3s 里的大头）。
+        # 挪到启动期只让启动多几秒，换来的是"就绪即真的可用"。
+        # 空库时 `_init_bm25` 走短路分支（只置标记、不构建），不算启动失败。
+        ("构建检索索引", _init_bm25),
         # 放在最后：它要读向量库，必须等上一步加载完。空库不判失败，只记警告。
         ("校验知识库", _check_knowledge_base),
     ]
@@ -173,6 +186,13 @@ class DiagnosisResponse(BaseModel):
     debate_round: int = 0
     correlation_id: str = ""
     token_usage: dict = {}
+    # 图片没被识别出来时的可见提示（空串 = 无需提示）。
+    # 视觉失败此前是静默的：流程照跑、用户不知道照片没被用上。
+    image_warning: str = ""
+    # 落库后的记录 id。SSE 版一直有（前端拿它拼工单下载地址），
+    # 同步版此前丢掉了，前端只能提示"工单已生成但未落库"。
+    # 落库失败或追问轮次时为 None。
+    record_id: Optional[int] = None
 
 
 class RecordResponse(BaseModel):
@@ -215,13 +235,20 @@ def diagnose(request: DiagnosisRequest, _: None = Depends(require_api_key)):
             correlation_id=correlation_id
         )
 
-        # 仅当完整诊断时才保存记录
-        if result.get("status") != "need_more_info":
-            save_diagnosis_record(
-                request.fault_description,
-                result,
-                token_usage=result.get("token_usage", {})
-            )
+        # 仅当完整诊断时才保存记录（"哪些状态不落库"的口径见 status_meta.py）
+        record_id = None
+        if should_persist(result.get("status")):
+            try:
+                record_id = save_diagnosis_record(
+                    request.fault_description,
+                    result,
+                    token_usage=result.get("token_usage", {})
+                )
+            except Exception:
+                # 记录没存上 ≠ 诊断失败。用户已经等了数十秒、拿到了完整结论，
+                # 因为一次 SQLite 抖动把它变成 500 是不可接受的：用户既丢了结果，
+                # 也不知道"其实诊断是成功的"。口径与 SSE 版、app.py 保持一致。
+                logger.exception("save_diagnosis_record_failed", correlation_id=correlation_id)
 
         return {
             "status": result.get("status", "unknown"),
@@ -235,6 +262,9 @@ def diagnose(request: DiagnosisRequest, _: None = Depends(require_api_key)):
             "debate_round": result.get("debate_round", 0),
             "correlation_id": result.get("correlation_id", correlation_id),
             "token_usage": result.get("token_usage", {}),
+            "image_warning": result.get("image_warning", ""),
+            # 与 SSE 版对齐：带上记录 id，前端才能直接拼出工单下载地址
+            "record_id": record_id,
         }
 
     except Exception as e:
@@ -299,10 +329,10 @@ def diagnose_stream(request: DiagnosisRequest, _: None = Depends(require_api_key
                     "correlation_id": correlation_id,
                 })
 
-            # 落库口径与 /diagnose 保持一致：追问中的轮次不存，
-            # 否则历史列表里会塞满"半成品"，用户按关键词翻到的都是没结论的记录。
+            # 落库口径与 /diagnose 保持一致（唯一来源见 status_meta.py）：
+            # 追问中的轮次不存，否则历史列表里会塞满"半成品"。
             record_id = None
-            if final_state.get("status") != "need_more_info":
+            if should_persist(final_state.get("status")):
                 record_id = save_diagnosis_record(
                     request.fault_description,
                     final_state,
@@ -321,6 +351,8 @@ def diagnose_stream(request: DiagnosisRequest, _: None = Depends(require_api_key
                 "debate_round": final_state.get("debate_round", 0),
                 "correlation_id": final_state.get("correlation_id", correlation_id),
                 "token_usage": final_state.get("token_usage", {}),
+                # 图片没识别出来时要让用户看得见（与同步版口径一致）
+                "image_warning": final_state.get("image_warning", ""),
                 # 带上记录 id，前端才能直接拼出工单下载地址，
                 # 不必让用户跑到历史页去翻自己刚做完的这一次。
                 "record_id": record_id,
@@ -431,6 +463,37 @@ def stats(_: None = Depends(require_api_key)):
     return get_stats()
 
 
+@app.get("/meta/statuses")
+def meta_statuses():
+    """把状态值的口径暴露给前端，让前端不必再手抄一份。
+
+    **不需要鉴权**：这是静态元数据，不触碰任何外部依赖、也不含业务数据，
+    与 `/health/live`、`/health/ready` 同一类。
+
+    为什么值得单开一个端点：状态值是跨层契约（后端产生，前端决定标签与配色）。
+    此前后端一份、前端两处各抄一份，改一处漏一处就会出现"界面显示成未知状态"。
+    后端已收敛到 `status_meta.py`（唯一来源），这里把它带出去。
+
+    刻意**不下发** `icon` 与 `banner`：前者是 Streamlit 对照前端的展示细节，
+    后者是后端自己用的整句文案。前端拿到 `label` + `level` 就够渲染了
+    （`level` → 前端自己的配色），颜色仍由前端掌握。
+    """
+    return {
+        "version": API_VERSION,
+        "statuses": {
+            name: {
+                "label": meta.label,
+                "level": meta.level,
+                "terminal": meta.terminal,
+                "failure": meta.failure,
+                "persisted": meta.persisted,
+                "followup": meta.followup,
+            }
+            for name, meta in STATUS_META.items()
+        },
+    }
+
+
 @app.get("/health/live")
 def health_live():
     """存活探针：只确认进程还在，不触碰任何外部依赖，毫秒级返回。
@@ -477,21 +540,34 @@ def health_ready():
 
 
 @app.get("/health", response_model=HealthResponse)
-def health(fresh: bool = False):
+def health(fresh: bool = False, x_api_key: str = Header(default="")):
     """就绪探针：探活 LLM、Embedding、ChromaDB、SQLite。
 
     结果默认缓存 settings.HEALTH_CACHE_TTL 秒——Docker healthcheck 每 30s 打一次，
     每次都真调 LLM + Embedding 既拖慢探活又白烧配额。加 ?fresh=true 可强制真探。
-    """
-    now = time.time()
-    if (not fresh
-            and _health_cache["payload"] is not None
-            and now - _health_cache["ts"] < settings.HEALTH_CACHE_TTL):
-        return _health_cache["payload"]
 
-    payload = _collect_health()
-    _health_cache["ts"] = now
-    _health_cache["payload"] = payload
+    ⚠️ **`fresh=true` 必须鉴权**：它会真调 1 次 LLM + 2 次 Embedding。
+    `docs/PROJECT_GUIDE.md` 一直承诺"配了 API_KEY 时需带 X-API-Key"，
+    但代码里从来没有这道校验——等于给任何能访问到端口的人一个烧配额的开关。
+    未配置 `settings.API_KEY` 时保持放行，与全仓的可选鉴权口径一致。
+
+    缓存命中（`fresh=false`）不触发鉴权：它只读内存里的旧结果，
+    不碰任何外部依赖，没有烧配额的风险，Docker healthcheck 也就不必配密钥。
+    """
+    if fresh:
+        require_api_key(x_api_key)
+
+    now = time.time()
+    with _health_cache_lock:
+        # 双重检查在锁内完成：等锁期间别的线程可能已经把结果填好了
+        if (not fresh
+                and _health_cache["payload"] is not None
+                and now - _health_cache["ts"] < settings.HEALTH_CACHE_TTL):
+            return _health_cache["payload"]
+
+        payload = _collect_health()
+        _health_cache["ts"] = time.time()
+        _health_cache["payload"] = payload
     return payload
 
 
@@ -510,17 +586,41 @@ def _collect_health() -> dict:
         components["sqlite"] = {"status": "unhealthy", "error": str(e)}
         overall_healthy = False
 
-    # 2. ChromaDB
+    # 2. Embedding —— 先算，因为 Chroma 探活可以直接复用这个向量。
+    #
+    # 此前两步各自嵌了一次 "test"：`similarity_search("test", k=1)` 内部会
+    # `embed_query("test")`，紧接着第 4 步又 `embed_query("test")` 一次。
+    # 一次真探因此打两次 Embedding API，而这两个向量**逐字节相同**。
+    # 现在只嵌一次，用 `similarity_search_by_vector` 把它喂给 Chroma。
+    probe_vector = None
+    try:
+        emb = get_embeddings()
+        probe_vector = emb.embed_query("test")
+        components["embedding"] = {
+            "status": "healthy",
+            "model": settings.EMBEDDING_MODEL,
+            "dimension": len(probe_vector)
+        }
+    except Exception as e:
+        components["embedding"] = {"status": "unhealthy", "error": str(e), "model": settings.EMBEDDING_MODEL}
+        overall_healthy = False
+
+    # 3. ChromaDB
     try:
         db = get_chroma_db()
-        # 简单查询测试
-        db.similarity_search("test", k=1)
+        if probe_vector is not None:
+            # 复用上面那个向量，不再多嵌一次
+            db.similarity_search_by_vector(probe_vector, k=1)
+        else:
+            # 嵌入已经不可用了，这里只能退回文本检索（它会再嵌一次）。
+            # 这是降级路径而不是常态：反正整体已经是 degraded，多一次调用无所谓。
+            db.similarity_search("test", k=1)
         components["chromadb"] = {"status": "healthy", "path": settings.CHROMA_PERSIST_DIR}
     except Exception as e:
         components["chromadb"] = {"status": "unhealthy", "error": str(e)}
         overall_healthy = False
 
-    # 3. LLM (诊断模型)
+    # 4. LLM (诊断模型)
     try:
         llm = get_llm()
         # 简单调用测试
@@ -532,19 +632,6 @@ def _collect_health() -> dict:
         }
     except Exception as e:
         components["llm_diagnosis"] = {"status": "unhealthy", "error": str(e), "model": settings.DIAGNOSIS_MODEL}
-        overall_healthy = False
-
-    # 4. Embedding
-    try:
-        emb = get_embeddings()
-        vec = emb.embed_query("test")
-        components["embedding"] = {
-            "status": "healthy",
-            "model": settings.EMBEDDING_MODEL,
-            "dimension": len(vec)
-        }
-    except Exception as e:
-        components["embedding"] = {"status": "unhealthy", "error": str(e), "model": settings.EMBEDDING_MODEL}
         overall_healthy = False
 
     # 5. Vision LLM (可选)
@@ -573,5 +660,7 @@ def root():
         # live = 进程活着；ready = 能接诊断请求；health = 依赖全健康（会烧配额）
         "health": "/health",
         "health_live": "/health/live",
-        "health_ready": "/health/ready"
+        "health_ready": "/health/ready",
+        # 状态值的口径（标签/是否终态/是否落库…），前端据此不必手抄一份
+        "meta_statuses": "/meta/statuses",
     }

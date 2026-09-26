@@ -16,6 +16,7 @@ from agents import (
 )
 from config import settings
 from logging_config import get_logger, get_token_tracker, clear_token_tracker
+from status_meta import TERMINAL_FAILURE_STATUSES
 
 logger = get_logger(__name__)
 
@@ -23,6 +24,10 @@ logger = get_logger(__name__)
 class AgentState(TypedDict):
     user_input: str
     image_description: str
+    # 图片没被识别出来时的可见提示（空串表示无需提示）。
+    # 为什么要有它：视觉调用失败此前只是静默返回空描述，流程照跑，
+    # 用户完全不知道照片没被用上——"没识别出来"和"没传照片"在界面上长得一模一样。
+    image_warning: str
     fault_info: Optional[dict]
     followup_question: str
     evidence: str
@@ -42,8 +47,18 @@ class AgentState(TypedDict):
     correlation_id: str  # 追踪 ID
 
 
-# 终态集合：这些状态由失败/降级分支产生，cost / workorder 节点不得覆盖成 costed/done
-TERMINAL_FAILURE_STATUSES = ("insufficient_knowledge", "llm_failed", "pending_human_review")
+# 终态集合：这些状态由失败/降级分支产生，cost / workorder 节点不得覆盖成 costed/done。
+#
+# **唯一来源已挪到 `status_meta.py`**（那里还有标签/配色/是否落库/是否可追问）。
+# 这里保留同名模块属性，是因为 orchestrator 内部、app.py、eval_test.py 都在引用它；
+# 直接删掉会变成一次跨文件改名，与本条修复无关。新增状态请改 status_meta.py。
+
+# 终审置信度低于此值时，即便审核意见是"通过"，工单也要标风险。
+#
+# 为什么不能只看"通过/不通过"：终审 prompt 里"通过"的判定标准是**找不到问题**，
+# 而模型对"我没把握但挑不出错"的情况同样会输出"通过"并把置信度写成 30。
+# 只按意见放行，等于把"模型自己都不确定"的结论以"正常"面貌交付。
+LOW_CONFIDENCE_THRESHOLD = 60
 
 # 模型不可用时的占位诊断。刻意写成"降级形态"，让 _is_degraded 能识别，
 # 从而避免辩论环节拿着空诊断反复空转。
@@ -482,6 +497,30 @@ def workorder_node(state: AgentState) -> AgentState:
         workorder["风险等级"] = "高风险待复核"
         workorder["风险说明"] = "诊断结论经多轮辩论仍未通过审核，建议人工复核后执行"
 
+    # 辩论"维持"原判：路由层会跳过最终复审（见 route_after_rebuttal，省 1 次 LLM 调用）。
+    # 省调用不能变成悄悄降低把关强度 —— 此时审核意见很可能仍是"不通过"，
+    # 而结论**没有经过独立复审确认**。必须在工单上写出来，否则用户无法区分
+    # "审过了"和"没审"。
+    rebuttal = state.get("rebuttal") or {}
+    if rebuttal.get("行动") == "维持":
+        workorder["风险等级"] = "中风险（辩论未改变结论）"
+        workorder["风险说明"] = (
+            "诊断师在辩论中维持原结论、未采纳审核意见，本轮未经最终复审确认，"
+            "建议人工复核后再执行"
+        )
+
+    # 终审"通过但置信度低"：形式上过关，实质上模型自己并不确定。
+    # 只按审核意见放行会让这类结论以"正常"面貌交付（见 LOW_CONFIDENCE_THRESHOLD 的说明）。
+    confidence = final_review.get("置信度")
+    if (final_review.get("审核意见") == "通过"
+            and isinstance(confidence, int)
+            and confidence < LOW_CONFIDENCE_THRESHOLD):
+        workorder["风险等级"] = "中风险（终审置信度偏低）"
+        workorder["风险说明"] = (
+            f"最终复审判定通过，但置信度仅 {confidence}/100"
+            f"（低于 {LOW_CONFIDENCE_THRESHOLD}），结论稳定性不足，建议人工复核"
+        )
+
     # 降级时把"为什么答不了 + 下一步能做什么"一并写进风险说明。
     # 此前只有一句「建议人工介入」，用户拿到手等于没拿到东西。
     diag = _effective_diagnosis(state)
@@ -516,16 +555,32 @@ def human_review_node(state: AgentState) -> AgentState:
 
 
 def final_review_node(state: AgentState) -> AgentState:
-    """最终复审：审核师对诊断师的辩论反驳进行最终判断"""
+    """最终复审：审核师对诊断师的辩论反驳进行最终判断。
+
+    与初审 review_node 一样要把 evidence / disagreements 传下去：终审才是决定
+    终态的那一步，对照物比初审少就只剩下"看谁说得更顺"。此前这里只传了
+    「原诊断 + 反驳」两样。
+    """
     if not state.get("rebuttal"):
         # 辩论没产出（模型失败或已降级），复审没有可审对象，直接跳过这次调用
         logger.warning("final_review_skipped_no_rebuttal", correlation_id=state["correlation_id"])
         return {"final_review": {}, "status": state.get("status", "llm_failed")}
 
+    evidence = state.get("evidence", "")
+    disagreements = extract_kb_disagreements(evidence)
+    if disagreements:
+        logger.info(
+            "final_review_kb_disagreements",
+            count=len(disagreements),
+            entries=[d.get("条目") for d in disagreements],
+            correlation_id=state["correlation_id"],
+        )
     final_review = agent_review_final(
         original_diagnosis=state.get("diagnosis", {}),
         rebuttal=state.get("rebuttal", {}),
-        correlation_id=state["correlation_id"]
+        correlation_id=state["correlation_id"],
+        evidence=evidence,
+        disagreements=disagreements,
     )
     if not final_review:
         logger.error("final_review_llm_failed", correlation_id=state["correlation_id"])
@@ -558,6 +613,23 @@ def route_after_final_review(state: AgentState):
         return "rebuttal"
 
     return "cost"
+
+
+def route_after_rebuttal(state: AgentState):
+    """辩论后路由：维持原判→直接出结果；有修正→进最终复审。
+
+    诊断师说"维持"意味着它不认可审核意见、结论没有变化。此时再跑一次最终复审，
+    审核师手上的材料与上一轮完全相同（同一份诊断 + 同一份证据），结论大概率还是
+    "不通过"，等于白烧一次 LLM 调用（终审占总用量约 12%、单次 3~4 秒）。
+    反驳/修正则不同——结论变了，审核师才有新东西可审，这一次调用是值得的。
+
+    省下这一次的前提是**工单必须标出"未经最终复审"**（见 workorder_node）：
+    少跑一步是提速，隐瞒少跑一步是降低把关强度，两者不能混为一谈。
+    """
+    rebuttal = state.get("rebuttal") or {}
+    if rebuttal.get("行动") == "维持":
+        return "cost"
+    return "final_review"
 
 
 def route_after_review(state: AgentState):
@@ -645,7 +717,14 @@ graph.add_conditional_edges(
     }
 )
 
-graph.add_edge("rebuttal", "final_review")
+graph.add_conditional_edges(
+    "rebuttal",
+    route_after_rebuttal,
+    {
+        "final_review": "final_review",
+        "cost": "cost"
+    }
+)
 
 graph.add_conditional_edges(
     "final_review",
@@ -684,14 +763,22 @@ def _build_initial_state(user_input: str, image_base64: str = "", correlation_id
         correlation_id = str(uuid.uuid4())[:8]
 
     image_description = ""
+    image_warning = ""
     if image_base64:
         # 视觉调用发生在图执行之前，单独归因，不混进第一个节点
         get_token_tracker(correlation_id).start_node("image_extract")
         image_description = extract_image_info(image_base64, correlation_id=correlation_id)
+        if not image_description:
+            # 识别失败必须让用户看得见：他传了照片，却只按文字诊断，
+            # 而界面上毫无提示 —— 他会以为照片被用上了。
+            # 注意这**不是**降级：文字描述本身可能已经足够，诊断照常进行。
+            image_warning = "图片未能识别，本轮仅依据文字描述诊断"
+            logger.warning("image_extract_unavailable", correlation_id=correlation_id)
 
     return {
         "user_input": user_input,
         "image_description": image_description,
+        "image_warning": image_warning,
         "fault_info": None,
         "followup_question": "",
         "evidence": "",
@@ -747,14 +834,20 @@ def run_diagnosis(user_input: str, image_base64: str = "", correlation_id: str =
 
 def run_diagnosis_stream(user_input: str, image_base64: str = "", correlation_id: str = None):
     """流式版：边执行边 yield (阶段说明, 当前累计状态)。
-    调用方循环结束后，最后一个 state_snapshot 即最终结果。"""
+    调用方循环结束后，最后一个 state_snapshot 即最终结果。
+
+    ⚠️ 每次 yield 的都是**浅拷贝**。此前一路 `merged.update(...)` 之后直接
+    `yield (label, merged)`，所有快照指向同一个 dict —— SSE 端因为立刻序列化看不出问题，
+    但任何"把每步快照收进列表"的消费方（回放、调试面板、离线评估）拿到的 N 份快照
+    会**全部变成终态**，看起来像"每一步的结论都一样"。拷贝的代价可以忽略。
+    """
     correlation_id = correlation_id or str(uuid.uuid4())[:8]
     initial_state = _build_initial_state(user_input, image_base64, correlation_id)
     merged = {k: v for k, v in initial_state.items()}
 
     logger.info("diagnosis_stream_start", correlation_id=correlation_id)
 
-    yield ("🚀 启动多Agent协作诊断...", merged)
+    yield ("🚀 启动多Agent协作诊断...", dict(merged))
 
     try:
         for update in app.stream(initial_state, config={"recursion_limit": settings.GRAPH_RECURSION_LIMIT}, stream_mode="updates"):
@@ -765,7 +858,7 @@ def run_diagnosis_stream(user_input: str, image_base64: str = "", correlation_id
             if node_update:
                 merged.update(node_update)
             label = NODE_DESCRIPTIONS.get(node_name, f"执行节点: {node_name}")
-            yield (label, merged)
+            yield (label, dict(merged))
 
         # 最终收集 token 统计
         tracker = get_token_tracker(correlation_id)
