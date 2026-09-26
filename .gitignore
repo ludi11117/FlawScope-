@@ -32,6 +32,8 @@ ENV/
 *.sqlite
 *.sqlite3
 chroma_db/
+# 重建向量库前的旧库备份（扩库/换嵌入模型时留的后悔药，不入库）
+chroma_db.bak_*/
 eval_reports/
 *.log
 

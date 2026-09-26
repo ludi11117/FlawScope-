@@ -118,6 +118,11 @@ def _grounded_in_evidence(candidate: str, evidence: str) -> bool:
 
 
 def _parse_json_quiet(text: str) -> dict:
+    # 非字符串输入（None / 数字）也当作"解析不出来"：这个函数的名字里写着 quiet，
+    # 就不该在输入不合法时抛 AttributeError。调用方虽然有 None 判断，
+    # 但那是一层隐性契约，不如在这里收口。
+    if not isinstance(text, str):
+        return {}
     try:
         return json.loads(text)
     except (json.JSONDecodeError, TypeError):
@@ -517,7 +522,7 @@ def build_markdown(meta: dict, metrics: dict, debate: dict, records: list) -> st
     lines.append(f"| ⑦ 误降级 | {m['false_degradation']['bad']}/{m['false_degradation']['total']} | {format_rate(m['false_degradation']['rate'])} | 有依据的案例却被错误拒绝诊断 |")
     if m.get("snapshot_regression") and m["snapshot_regression"]["total"] > 0:
         sr = m["snapshot_regression"]
-        lines.append(f"| ⑧ 快照回归通过率 | {sr['total'] - sr['changed']}/{sr['total']} | {format_rate(1 - sr['rate']) if sr['rate'] else 'N/A'} | 输出与基准快照一致的比例 |")
+        lines.append(f"| ⑧ 快照回归通过率 | {sr['total'] - sr['changed']}/{sr['total']} | {format_rate(1 - sr['rate']) if sr['rate'] is not None else 'N/A'} | 输出与基准快照一致的比例 |")
     lines.append("")
 
     lines.append("## 二、辩论增益分析")
@@ -594,7 +599,7 @@ def print_console_summary(metrics: dict, debate: dict):
     print(f"⑦ 误降级                 {m['false_degradation']['bad']}/{m['false_degradation']['total']}  {format_rate(m['false_degradation']['rate'])}")
     if m.get("snapshot_regression") and m["snapshot_regression"]["total"] > 0:
         sr = m["snapshot_regression"]
-        print(f"⑧ 快照回归通过率          {sr['total'] - sr['changed']}/{sr['total']}  {format_rate(1 - sr['rate']) if sr['rate'] else 'N/A'}")
+        print(f"⑧ 快照回归通过率          {sr['total'] - sr['changed']}/{sr['total']}  {format_rate(1 - sr['rate']) if sr['rate'] is not None else 'N/A'}")
     print("-" * 72)
     print("辩论增益分析")
     print("-" * 72)

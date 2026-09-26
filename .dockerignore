@@ -1,31 +1,85 @@
-# Python 缓存与字节码
+# Docker 构建上下文排除清单（后端镜像）。
+#
+# 为什么这件事重要：`Dockerfile` 是 `COPY . .`，而仓库里既有 1.8G 的 venv、
+# 76M 的 web/node_modules，也有**受版权保护、README 明确写了不得分发**的
+# `data/raw/siemens_DA_1106_cs.pdf`，还有运行期数据库 `diagnosis_history.db-wal`。
+# 不排除它们 = 镜像里带着源码之外的一堆东西，其中一部分是不该分发的。
+
+# ---------- 版本控制与备份 ----------
+.git/
+# 2026-09-18 仓库损坏时留下的副本，741K 且毫无运行价值
+.git_corrupted_20260918/
+.gitattributes
+.gitignore
+
+# ---------- Python 缓存与字节码 ----------
 __pycache__/
 *.pyc
 *.pyo
 
-# 虚拟环境
+# ---------- 虚拟环境 ----------
 venv/
 .venv/
 
-# 敏感配置：密钥不进镜像，运行时就交换机挂载
+# ---------- 敏感配置：密钥不进镜像，运行时就交换机挂载 ----------
 .env
 .env.*
 
-# IDE / 系统文件
+# ---------- 运行期数据：必须由挂载卷提供，不能烤进镜像 ----------
+# 向量库 2.9M，可由 build_knowledge_base.py 重建；
+# 数据库与它的 WAL/SHM 是运行期状态，进镜像等于把本机的历史记录发出去。
+chroma_db/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# ---------- 受版权保护的原始资料 ----------
+# README 明确写了 data/raw/siemens_DA_1106_cs.pdf 受版权保护、不得分发。
+# 注意只排除 raw/：data/knowledge_base.txt 是重建向量库的输入，必须保留。
+data/raw/
+
+# ---------- 前端源码与依赖（前端有独立镜像） ----------
+# 后端镜像完全不需要前端产物；node_modules 尤其不能进（76M + 19M）。
+node_modules/
+**/node_modules/
+web/node_modules/
+web/dist/
+web/.vite/
+
+# ---------- 开发期产物与缓存 ----------
+.recovery/
+.ruff_cache/
+.pytest_cache/
+.tmp_smoke/
+*.tsbuildinfo
+
+# ---------- 测试与评估（运行期用不到，且评估脚本会真花钱） ----------
+tests/
+tools/
+eval_test.py
+ablate_single_vs_multi.py
+compare_single_vs_multi.py
+eval_reports/
+test_cases.json
+retrieval_explain.json
+pytest.ini
+
+# ---------- 截图与日志 ----------
+_shot_*.png
+*.log
+
+# ---------- IDE / 系统文件 ----------
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
 
-# 测试与评估脚本
-eval_test.py
-*.log
-
-# 早期原型脚本（已归档到 legacy/，不再随镜像分发）
+# ---------- 早期原型（已冻结） ----------
 legacy/
+.streamlit/
 
-# 仓库元数据与静态检查配置（运行期用不到）
+# ---------- 仓库元数据与静态检查配置（运行期用不到） ----------
 .github/
 ruff.toml
-.pytest_cache/
 .workbuddy-ai/

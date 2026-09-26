@@ -6,6 +6,20 @@ on:
   pull_request:
     branches: [main]
 
+# 同一分支的新推送取消仍在跑的旧任务。CI 是守门人，不是审计记录：
+# 让已经过期的运行继续占着 runner 分钟，只会让排队时间变长、结果变旧。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  # 与本地 venv 对齐（本机 `ruff --version` = 0.16.8）。
+  # 之前是 `pip install --upgrade pip ruff`，注释自己都承认"会漂移"——
+  # 上游某天多出一条新规则，就会变成"本地全绿、CI 全红，而两边代码一模一样"。
+  # 升版本时两边一起改。
+  RUFF_VERSION: "0.16.8"
+
 jobs:
   lint:
     name: Lint (ruff)
@@ -16,11 +30,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      # 建议把版本与本地对齐后固定（pip install ruff==x.y.z），避免 CI 规则集漂移
-      - name: Install ruff
-        run: python -m pip install --upgrade pip ruff
+      - name: Install ruff (pinned)
+        run: python -m pip install "ruff==${RUFF_VERSION}"
 
       - name: Run ruff
         run: ruff check . --output-format=github
@@ -34,15 +47,68 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pytest-cov
 
-      - name: Run pytest
+      # 覆盖率门槛按**当前基线**定，不虚高。
+      # 本机实测（2026-09-25，519 passed）：核心模块合计 89%
+      #   agents 86% / api 88% / orchestrator 88% / database 95%
+      #   config 91% / logging_config 99% / prompt_loader、startup_status、
+      #   workorder_export 100%
+      # 取 88 是给"新增几十行还没配测试"留一点余量，而不是给"随便写"留空间。
+      #
+      # ⚠️ 统计范围必须在这里显式列出（`--cov=模块` 逐个写）。
+      # 不要改成裸 `--cov` + `[coverage:run] source`：裸 `--cov` 等价于 `--cov=.`，
+      # 会**覆盖** coverage 的 source 设置，于是 tests/、legacy/、tools/ 全被算进来，
+      # 覆盖率从 89% 掉到 74%，而配置看起来是生效的（实测踩过一次）。
+      #
+      # 本地等价命令（与这里逐字一致）：
+      #   ./venv/Scripts/python.exe -m pytest -q --cov=agents --cov=orchestrator \
+      #     --cov=api --cov=database --cov=config --cov=prompt_loader \
+      #     --cov=startup_status --cov=workorder_export --cov=logging_config \
+      #     --cov-report=term-missing --cov-fail-under=88
+      - name: Run pytest with coverage
         env:
           SILICONFLOW_API_KEY: test-key-for-unit-tests
-        run: pytest -q
+        run: |
+          pytest -q \
+            --cov=agents --cov=orchestrator --cov=api --cov=database \
+            --cov=config --cov=prompt_loader --cov=startup_status \
+            --cov=workorder_export --cov=logging_config \
+            --cov-report=term-missing --cov-fail-under=88
+
+  frontend:
+    name: Frontend (typecheck / test / build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # 用 `npm ci` 而不是 `npm install`：严格按 lock 装，
+      # 保证 CI 里的依赖版本与本地/镜像完全一致。
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build

@@ -1,0 +1,37 @@
+# pre-commit 配置：把 CI 的 lint 提前到"提交前"。
+#
+# 为什么值得加：CI 的 lint job 要等 push 之后才跑，一次往返就是几分钟；
+# 而 F401（未使用导入）这类问题本地一条命令就能发现。提交前拦下它，
+# 省下的是往返时间，不是"多一道流程"。
+#
+# 只挂 **linter**，不挂 formatter：本仓库的 ruff 配置（ruff.toml）刻意只启用
+# 能确定性验证的规则集，从未跑过 `ruff format`。挂上 formatter 会在第一次运行时
+# 把整个代码库重排一遍 —— 那是另一件事，不该混在"加 pre-commit"里偷偷做掉。
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # 与 ruff.toml 无关，这是 hook 的版本，必须与本地 `ruff --version` 一致
+    # （本机 0.16.8）。升版本时 CI（.github/workflows/ci.yml 的 RUFF_VERSION）、
+    # 这里、以及本地 venv 三处一起改。
+    rev: v0.16.8
+    hooks:
+      - id: ruff
+        args: [--output-format=concise]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      # 防止把合并冲突标记提交上去
+      - id: check-merge-conflict
+      # 防止提交语法错误的 YAML / JSON（docker-compose、test_cases、快照都靠它们）
+      - id: check-yaml
+      - id: check-json
+        exclude: ^(\.recovery/|web/node_modules/)
+      # 大文件不进仓库（模型权重、PDF、数据库）
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      # 行尾与文件结尾的空白：与 ruff 的 W291/W293 口径一致
+      - id: end-of-file-fixer
+        exclude: ^(\.recovery/|web/node_modules/|chroma_db/)
+      - id: trailing-whitespace
+        exclude: ^(\.recovery/|web/node_modules/|chroma_db/)

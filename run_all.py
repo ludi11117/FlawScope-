@@ -192,6 +192,12 @@ class Service:
             errors="replace",
             bufsize=1,
             creationflags=_NO_WINDOW,
+            # POSIX 上必须给子进程**开一个新的会话/进程组**。
+            # 否则它与启动器同组，`terminate()` 里的
+            # `os.killpg(os.getpgid(pid))` 会把启动器自己也一起杀掉 ——
+            # 表现为"关掉一个服务，整个启动器连同另一个服务一起消失"。
+            # Windows 不用这个参数（那边靠 taskkill /T 与 job object）。
+            start_new_session=not IS_WINDOWS,
             env=env,
         )
         _SERVICES.append(self)
@@ -439,10 +445,26 @@ def print_header() -> None:
     print()
 
 
-def find_python() -> Path:
-    """后端用的解释器：优先项目 venv，缺失时退回当前解释器。"""
-    python = ROOT / "venv" / "Scripts" / "python.exe"
-    return python if python.exists() else Path(sys.executable)
+def find_python(root: Path | None = None) -> Path:
+    """后端用的解释器：优先项目 venv，缺失时退回当前解释器。
+
+    两种 venv 布局都要认：
+      - Windows：`venv/Scripts/python.exe`
+      - POSIX  ：`venv/bin/python`
+    只认前者的话，在 macOS / Linux 上跑启动器会**静默**退回系统解释器 ——
+    于是依赖装在了 venv 里却用系统 Python 启动，报一堆 ModuleNotFoundError。
+    """
+    base = root if root is not None else ROOT
+    candidates = [
+        base / "venv" / "Scripts" / "python.exe",
+        base / "venv" / "bin" / "python",
+        base / ".venv" / "Scripts" / "python.exe",
+        base / ".venv" / "bin" / "python",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return Path(sys.executable)
 
 
 def find_node() -> tuple[Path | None, Path | None]:
@@ -531,6 +553,51 @@ def print_node_missing() -> None:
     print(dim('        setx FLAWSCOPE_NPM  "D:\\path\\to\\npm.cmd"'))
 
 
+def frontend_command(node: Path | None, npm: Path | None) -> list | None:
+    """决定用哪条命令拉起前端；两者都不可用时返回 None。
+
+    优先 npm（canonical 入口）；只有 node 时直接跑 vite 的 JS 入口，
+    绕开 npm.cmd 这层 Windows 脚本（它偶尔会带来额外的控制台窗口）。
+
+    单独抽成纯函数是为了可测：此前这段判断写在内联的 if/else 里，
+    而它的分支恰好是"只有 node 没有 npm"这种**平时跑不到、出事才发现**的路径。
+    """
+    if npm is not None:
+        return [str(npm), "run", "dev"]
+    if node is not None:
+        return [str(node), str(WEB_DIR / "node_modules" / "vite" / "bin" / "vite.js")]
+    return None
+
+
+def print_npm_missing() -> None:
+    """只找到 node、没找到 npm 时的可读指引。
+
+    为什么不能"凑合一下"：前端依赖要靠 npm 装，拿 `str(None)` 去 subprocess.call
+    会抛 FileNotFoundError，用户看到的是一个没头没尾的 traceback。
+    """
+    print(red("[错误] 找到了 node，但没找到 npm，无法自动安装前端依赖。"))
+    print()
+    print(dim("      npm 通常随 Node.js 一起安装。若你的 node 来自 nvm / scoop / volta，"))
+    print(dim("      npm 可能不在同一目录，用环境变量指一下即可（改完重开窗口生效）："))
+    print(dim('        Windows      setx FLAWSCOPE_NPM "D:\\path\\to\\npm.cmd"'))
+    print(dim("        macOS/Linux  export FLAWSCOPE_NPM=/usr/local/bin/npm"))
+    print()
+    print(dim("      或者手动进 web 目录执行一次 npm install，再重跑本启动器。"))
+
+
+def install_frontend_deps(npm: Path | None) -> int:
+    """安装前端依赖；npm 缺失时给出可读指引并返回非零码。"""
+    if npm is None:
+        print_npm_missing()
+        return 1
+    print(yellow("前端依赖未安装，首次启动需要几分钟…"))
+    print()
+    rc = subprocess.call([str(npm), "install"], cwd=str(WEB_DIR))
+    if rc != 0:
+        print(red("npm install 失败，请手动在 web 目录执行后重试。"))
+    return rc
+
+
 def build_services() -> tuple[Service, Service]:
     python = find_python()
     node, npm = find_node()
@@ -553,10 +620,10 @@ def build_services() -> tuple[Service, Service]:
 
     # 优先 npm（ canonical 入口）；只有 node 时直接跑 vite 的 JS 入口，
     # 绕开 npm.cmd 这层 Windows 脚本（它偶尔会带来额外的控制台窗口）。
-    if npm is not None:
-        frontend_cmd = [str(npm), "run", "dev"]
-    else:
-        frontend_cmd = [str(node), str(WEB_DIR / "node_modules" / "vite" / "bin" / "vite.js")]
+    frontend_cmd = frontend_command(node, npm)
+    if frontend_cmd is None:  # 理论上上面已经拦下，这里只是不让 None 流进 Service
+        print_node_missing()
+        sys.exit(1)
 
     frontend = Service("前端", "前端", frontend_cmd, WEB_DIR, yellow)
     return backend, frontend
@@ -658,11 +725,8 @@ def main() -> int:
         return 1
 
     if not (WEB_DIR / "node_modules").exists():
-        print(yellow("前端依赖未安装，首次启动需要几分钟…"))
-        print()
-        rc = subprocess.call([str(npm), "install"], cwd=str(WEB_DIR))
+        rc = install_frontend_deps(npm)
         if rc != 0:
-            print(red("npm install 失败，请手动在 web 目录执行后重试。"))
             return rc
 
     for port, what in ((BACKEND_PORT, "后端"), (FRONTEND_PORT, "前端")):

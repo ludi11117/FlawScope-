@@ -96,7 +96,7 @@ python orchestrator.py               # 命令行直接跑一次诊断
 **只跑测试不需要密钥**（`tests/conftest.py` 会兜底塞一个假 key）：
 
 ```bash
-venv/Scripts/python.exe -m pytest -q        # 157 项，全离线，约 13 秒
+venv/Scripts/python.exe -m pytest -q        # 563 项，全离线，约 9 秒
 ```
 
 ---
@@ -107,7 +107,7 @@ venv/Scripts/python.exe -m pytest -q        # 157 项，全离线，约 13 秒
 FlawScope/
 ├── orchestrator.py            ★ 状态机（调度中心）：定义 AgentState、十个节点、条件路由
 ├── agents.py                  ★ 所有"能力"：LLM 调用、检索、护栏、成本、Schema 校验
-├── app.py                       Streamlit 前端（诊断页 / 历史页 / 统计页）
+├── app.py                       Streamlit 前端（**仅作对照**，容器不再包含它；日常入口是 web/ 的 React 前端）
 ├── api.py                       FastAPI 接口层
 ├── database.py                  SQLite 读写 + 自动迁移
 ├── workorder_export.py          工单 → 可打印 Markdown（降级工单不补空章节）
@@ -119,7 +119,7 @@ FlawScope/
 ├── eval_test.py                 自动化评估（LLM 判官 + 程序化指标），会真实花钱
 ├── compare_single_vs_multi.py   单 Agent vs 多 Agent 对比实验
 ├── test_cases.json              评估用例集（含对抗案例）
-├── tests/                       157 项离线单测
+├── tests/                       563 项离线单测
 ├── data/knowledge_base.txt      原始知识库（示例级数据）
 ├── chroma_db/                   向量库持久化目录（gitignored）
 ├── diagnosis_history.db         诊断历史（gitignored）
@@ -478,13 +478,19 @@ CREATE TABLE diagnosis_records (
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/diagnose` | 提交故障描述（可带 base64 图片）执行诊断；并发超上限返回 503 |
+| POST | `/diagnose/stream` | **流式诊断（SSE）**：逐节点推 `progress`，最后推 `result` + `done`。前端默认走这条 |
 | GET | `/records` | 查历史，支持 `keyword` / `status` / `limit` / `offset` |
 | GET | `/records/{id}` | 单条详情 |
 | GET | `/records/{id}/workorder.md` | 导出该条记录的工单（可打印 Markdown） |
 | DELETE | `/records/{id}` | 删除 |
 | GET | `/stats` | 统计 |
-| GET | `/health/live` | **存活探针**：只确认进程在，毫秒级，不碰外部依赖 |
-| GET | `/health` | **就绪探针**：探活 LLM/Embedding/Chroma/SQLite，结果缓存 60s |
+| GET | `/meta/statuses` | **状态值口径**（label / level / 是否终态 / 是否落库 / 是否可追问）。静态元数据、无需鉴权，前端启动时拉一次覆盖内置兜底 |
+| GET | `/health/live` | **存活探针**：只确认进程在，毫秒级，不碰外部依赖，**启动期间也是 200** |
+| GET | `/health/ready` | **就绪探针**：初始化完成没，**未就绪返回 503**；只读内存状态，可高频轮询 |
+| GET | `/health` | **依赖探针**：真探 LLM/Embedding/ChromaDB/SQLite，结果缓存 60s |
+
+三个探针的分工不能混用：`live` 回答"进程要不要被重启"，`ready` 回答"请求现在能不能成功"，
+`health` 回答"依赖全不全"（**只有它会烧配额**）。
 
 三个容易踩的点：
 
@@ -497,7 +503,9 @@ CREATE TABLE diagnosis_records (
   （换筛选条件后结果变少，停在第 5 页会看到空列表，用户会误以为"一条都没有"）。
 - **`/health` 会真调 LLM + Embedding**，所以加了 TTL 缓存。
   容器 healthcheck 请用 `/health/live`，否则每 30s 一次持续烧配额。
-  `?fresh=true` 强制真探，属于"会花钱"的操作，配了 `API_KEY` 时需带 `X-API-Key`。
+  `?fresh=true` 强制真探，属于"会花钱"的操作：**配了 `API_KEY` 时强制校验 `X-API-Key`**
+  （未配置 API_KEY 的本地开发环境保持放行）。命中缓存时不校验——它只读内存，没有烧配额的风险。
+  缓存读写有锁：并发探活只会真探一次，不会各自烧一份配额。
 
 ### 并发闸门
 
@@ -722,7 +730,7 @@ find . -maxdepth 2 -type f -newermt '-90 seconds' \
 
 ```bash
 # 测试与检查
-venv/Scripts/python.exe -m pytest -q          # 157 项离线单测
+venv/Scripts/python.exe -m pytest -q          # 563 项离线单测
 ruff check .                                   # 静态检查
 ruff check . --statistics                      # 看各类问题数量
 
