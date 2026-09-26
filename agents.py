@@ -6,9 +6,11 @@ import jieba
 jieba.setLogLevel(logging.WARNING)
 
 import json
+import base64
 import re
 import time
 import threading
+from collections import OrderedDict
 from typing import Optional, Dict, List, Tuple
 
 from dotenv import load_dotenv
@@ -16,6 +18,12 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_chroma import Chroma
 from pydantic import BaseModel, Field, ValidationError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+)
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -58,6 +66,18 @@ _bm25_initialized = False
 # 构建索引要遍历整个知识库做 jieba 分词，代价很高；Streamlit 多会话 + FastAPI
 # 线程池会并发进来，必须加锁做双重检查，否则同一份索引会被反复重建。
 _bm25_lock = threading.Lock()
+
+# 检索结果缓存（LRU）。
+#
+# 一次诊断里 retrieve_evidence 最多被调 4 次（初检、每轮辩论、降级时的跨设备参考方向），
+# 而辩论重检索的 query 常与初检高度重叠 —— 每次都重算一次 embedding（一次网络往返）。
+# 命中缓存省掉的是**配额与耗时**，不是"少查一次库"。
+#
+# 键里带知识库块数：重建库后块数变化，旧键自然失效，不必手动清。
+# 另外 rebuild_bm25_index() 会显式清一次，覆盖"块数恰好没变"的重建场景。
+_RETRIEVAL_CACHE_MAX = 64
+_retrieval_cache: "OrderedDict[tuple, str]" = OrderedDict()
+_retrieval_cache_lock = threading.Lock()
 
 
 def get_llm() -> ChatOpenAI:
@@ -218,10 +238,27 @@ def _before_sleep(retry_state):
     )
 
 
+# 值得重试的 LLM 异常。
+#
+# 此前是 `retry_if_exception_type((Exception,))`：401（key 错）、400（请求体非法）、
+# 上下文超限这类**重试一万次也不会好**的错误，同样要白等 3 次指数退避
+# （1.5s / 2.25s / 3.375s）才失败。用户看到的是"卡了很久然后失败"，
+# 而不是"立刻告诉你 key 配错了"。
+#
+# 只保留真正可能是瞬时的四类：限流、超时、连接错误、服务端 5xx。
+# 其余异常立刻抛出，由 safe_llm_invoke 统一转成 None（走既有短路逻辑）。
+_RETRYABLE_LLM_ERRORS = (
+    RateLimitError,
+    APITimeoutError,
+    APIConnectionError,
+    InternalServerError,
+)
+
+
 @retry(
     wait=wait_exponential(multiplier=settings.LLM_RETRY_BACKOFF, min=1, max=10),
     stop=stop_after_attempt(settings.LLM_MAX_RETRIES + 1),
-    retry=retry_if_exception_type((Exception,)),
+    retry=retry_if_exception_type(_RETRYABLE_LLM_ERRORS),
     before_sleep=_before_sleep,
     reraise=True
 )
@@ -415,6 +452,7 @@ def invoke_and_validate(
     max_call_retries: int = 1,
     correlation_id: str = None,
     preprocess=None,
+    invoke_fn=None,
 ) -> Optional[BaseModel]:
     """调用 LLM → 解析 JSON → Pydantic 校验；校验失败时把错误回灌让模型自修。
 
@@ -425,11 +463,17 @@ def invoke_and_validate(
     但模型其实好好的，只是格式没对齐。回灌一次报错通常就能修好，代价远小于整链路重来。
 
     返回 None 表示彻底失败（模型不可用，或修正后仍不合规）。
+
+    `invoke_fn` 允许调用方替换实际发起调用的那一层（默认 `safe_llm_invoke`）。
+    存在理由：有些调用方需要**区分"模型没答"和"模型答了但格式不合规"**
+    （`extract_fault_info` 的两义返回值就靠它），而这个区分只有在
+    "谁真正发了请求"这一层才能观察到。
     """
+    invoke_fn = invoke_fn or safe_llm_invoke
     current_messages = list(messages)
 
     for attempt in range(max_call_retries + 1):
-        content = safe_llm_invoke(current_messages, llm, correlation_id)
+        content = invoke_fn(current_messages, llm, correlation_id)
         if content is None:
             logger.warning("llm_unavailable", attempt=attempt + 1, correlation_id=correlation_id)
             continue
@@ -437,6 +481,21 @@ def invoke_and_validate(
         data = safe_parse_json(content)
         if not data:
             logger.warning("json_parse_failed", attempt=attempt + 1, correlation_id=correlation_id)
+            if attempt >= max_call_retries:
+                break
+            # JSON 根本解析不出来同样要回灌。此前这里只 `continue`，
+            # 于是第二次调用拿到的是**一模一样**的消息 —— 模型没有任何新信息，
+            # 大概率再错一遍。回灌 Schema + 原始输出 + "解析失败"这条事实，
+            # 模型才有机会把 Markdown 代码块、前后解释文字去掉。
+            current_messages = current_messages + [
+                HumanMessage(content=render_prompt(
+                    PromptTemplates.FIX_SCHEMA,
+                    schema=json.dumps(model_class.model_json_schema(), ensure_ascii=False),
+                    errors="无法从你的回复中解析出 JSON 对象（可能被 Markdown 代码块包裹，"
+                           "或前后带了说明文字）",
+                    raw=content,
+                ))
+            ]
             continue
 
         if preprocess is not None:
@@ -514,10 +573,17 @@ def _get_bm25():
 
 
 def rebuild_bm25_index():
-    """强制重建 BM25 索引（知识库更新后调用）"""
+    """强制重建 BM25 索引（知识库更新后调用）。
+
+    同时清空检索结果缓存：缓存键里的"知识库块数"只覆盖"块数变了"的情况，
+    重建后块数恰好相同（例如改了某条内容但没增删）时旧结果会残留 ——
+    那正是最需要失效的场景。
+    """
     global _bm25_initialized
     with _bm25_lock:
         _bm25_initialized = False
+    with _retrieval_cache_lock:
+        _retrieval_cache.clear()
     _init_bm25()
 
 
@@ -562,6 +628,10 @@ def extract_fault_info(user_input: str, correlation_id: str = None) -> Optional[
                    绝不能退化成"信息不足"去追问用户——那是把服务故障甩锅给用户。
 
     此前两种情况都返回 ``{}``，于是模型挂掉时用户会被要求"补充设备类型"。
+
+    实现上接进统一的 `invoke_and_validate` 通道（校验失败会把 Schema + 原始输出 +
+    报错回灌让模型自修），但**两义返回值必须保住** —— 所以用一个探针记录
+    "这一轮到底有没有收到过内容"，见下面 `_tracking_invoke`。
     """
     prompt = render_prompt(PromptTemplates.EXTRACT_FAULT_INFO, user_input=user_input)
     messages = [
@@ -569,19 +639,24 @@ def extract_fault_info(user_input: str, correlation_id: str = None) -> Optional[
         HumanMessage(content=prompt)
     ]
 
-    llm_responded = False
-    for attempt in range(2):
-        content = safe_llm_invoke(messages, correlation_id=correlation_id)
-        if content is None:
-            logger.warning("extract_info_llm_unavailable", attempt=attempt + 1, correlation_id=correlation_id)
-            continue
+    # invoke_and_validate 对"模型没答"和"答了但格式不合规"都返回 None，
+    # 而这两种情况的处理**必须不同**（前者短路成 llm_failed，后者走追问）。
+    # 唯一的观察点就是真正发请求的那一层，所以在这里包一层探针。
+    saw_content = {"value": False}
 
-        llm_responded = True
-        validated = validate_and_parse(FaultInfo, safe_parse_json(content), correlation_id)
-        if validated:
-            return validated.model_dump()
+    def _tracking_invoke(msgs, llm=None, cid=None):
+        content = safe_llm_invoke(msgs, llm, cid)
+        if content is not None:
+            saw_content["value"] = True
+        return content
 
-    if not llm_responded:
+    validated = invoke_and_validate(
+        messages, FaultInfo, correlation_id=correlation_id, invoke_fn=_tracking_invoke
+    )
+    if validated:
+        return validated.model_dump()
+
+    if not saw_content["value"]:
         logger.error("extract_info_llm_failed", correlation_id=correlation_id)
         return None
 
@@ -608,19 +683,79 @@ def _reciprocal_rank_fusion(ranked_lists: List[List[str]], k: int, rrf_k: int = 
     return sorted(scores, key=lambda d: (-scores[d], len(d)))[:k]
 
 
-def retrieve_evidence(fault_description: str, k: int = None, correlation_id: str = None) -> str:
+def _normalize_query(text: str) -> str:
+    """检索 query 的规范化：只压空白。
+
+    不做分词/大小写之外的改写——缓存键必须**保守**：多命中一次是省一次调用，
+    误命中一次就是拿别的故障的证据回答本次故障。所以只抹掉纯粹表示形式差异的部分。
+    """
+    return " ".join(str(text or "").split())
+
+
+def device_filter(device: str) -> Optional[dict]:
+    """按设备过滤检索结果的 Chroma `where` 条件；未启用或设备名为空时返回 None。
+
+    ⚠️ **默认关闭**（`settings.RETRIEVAL_DEVICE_FILTER`），并且开启前必须先重建向量库：
+
+      1. 现有 `chroma_db/` 是**没有 metadata** 的旧库。带 `where` 条件去查一个
+         没有该字段的集合，结果是**召回为空** → 全线误降级。这不是"过滤太严"，
+         是"过滤条件根本对不上数据"。
+      2. 一刀切过滤本身也有风险：用户写「空压机」而库里章节名是「空气压缩机」时，
+         本来能召回的证据会被整段滤掉。
+      3. 所以它更合适的形态是**降级前的二次尝试**：先不带过滤检索；结果为空、
+         或设备护栏判定不匹配时，再带过滤重试一次，命中就继续、没命中才降级。
+         那样才不会把"过滤太严"变成"直接降级"。
+
+    第 3 条会牵动误降级指标（README 指标⑦），属于需要产品决策的改动，
+    因此这里只把**开关与数据**留好，不默认启用。
+    """
+    if not settings.RETRIEVAL_DEVICE_FILTER or not device:
+        return None
+    return {"device": device}
+
+
+def retrieve_evidence(fault_description: str, k: int = None, correlation_id: str = None,
+                      device: str = None) -> str:
+    """混合检索（向量 + BM25，RRF 融合），带结果缓存。
+
+    为什么加缓存：一次诊断里本函数最多被调 4 次（初检、每轮辩论、降级时的
+    `find_cross_device_hints`），而辩论重检索的 query 常与初检高度重叠。
+    每次调用都要打一次 embedding API（网络往返 + 配额），重复的完全可以省掉。
+
+    缓存键 = (规范化 query, k, 知识库块数)。带上块数是为了让"重建知识库"天然失效：
+    块数变了键就变了，不会读到旧库的证据。块数恰好没变的重建由
+    `rebuild_bm25_index()` 显式清缓存兜住。
+    """
     k = k or settings.RETRIEVAL_K
     db = get_db()
 
+    # 设备过滤默认关闭（见 device_filter 的说明）。开启时它同时进缓存键：
+    # 同一 query 带/不带过滤是两次不同的检索，混用会拿到错的证据。
+    filters = device_filter(device)
+
+    # 先取 BM25 索引：既要用它的文档数做缓存键，也要用它做关键词检索。
+    # 空库时 _get_bm25 会短路成 (None, [])，下面两条通道各自退化。
+    bm25_index, doc_texts = _get_bm25()
+    cache_key = (_normalize_query(fault_description), k, len(doc_texts or []),
+                 tuple(sorted((filters or {}).items())))
+
+    with _retrieval_cache_lock:
+        cached = _retrieval_cache.get(cache_key)
+        if cached is not None:
+            # LRU：命中即置为最近使用，淘汰时才能淘汰到真正冷的那条
+            _retrieval_cache.move_to_end(cache_key)
+    if cached is not None:
+        logger.info("retrieve_cache_hit", query=fault_description[:50], correlation_id=correlation_id)
+        return cached
+
     # 通道一：向量语义检索（擅长"一顿一顿"≈"转速不稳"这类语义改写）
-    vector_docs = db.similarity_search(fault_description, k=k)
+    # filters 为 None 时与不带过滤完全等价（Chroma 的默认行为）
+    vector_docs = db.similarity_search(fault_description, k=k, **({"filter": filters} if filters else {}))
     vector_texts = [doc.page_content for doc in vector_docs]
 
     # 通道二：BM25 关键词检索（擅长报警代码、型号等精确 token）
     # 两路各自取 k 再融合，是 RRF 的标准用法：每一路都先给自己最相关的文档，
     # 由融合算法决定最终名额。此前两路共用一个 k，BM25_K 配置形同虚设。
-    bm25_index, doc_texts = _get_bm25()
-
     bm25_texts = []
     if bm25_index is not None and doc_texts:
         tokenized_query = list(jieba.cut(fault_description))
@@ -634,16 +769,22 @@ def retrieve_evidence(fault_description: str, k: int = None, correlation_id: str
 
     if not combined:
         logger.info("retrieve_no_results", query=fault_description[:50], correlation_id=correlation_id)
-        return "【知识库无相关依据】"
+        result = "【知识库无相关依据】"
+    else:
+        result = "\n\n".join([f"【资料{i}】\n{text}" for i, text in enumerate(combined, 1)])
+        logger.info(
+            "retrieve_done",
+            bm25_hits=len(bm25_texts),
+            vector_hits=len(vector_texts),
+            fused=len(combined),
+            correlation_id=correlation_id
+        )
 
-    result = "\n\n".join([f"【资料{i}】\n{text}" for i, text in enumerate(combined, 1)])
-    logger.info(
-        "retrieve_done",
-        bm25_hits=len(bm25_texts),
-        vector_hits=len(vector_texts),
-        fused=len(combined),
-        correlation_id=correlation_id
-    )
+    with _retrieval_cache_lock:
+        if len(_retrieval_cache) >= _RETRIEVAL_CACHE_MAX:
+            _retrieval_cache.popitem(last=False)  # 淘汰最久未使用的
+        _retrieval_cache[cache_key] = result
+        _retrieval_cache.move_to_end(cache_key)
     return result
 
 
@@ -669,11 +810,40 @@ EQUIPMENT_SYNONYMS = {
     "输送带": ("皮带机", "皮带输送机"),
     "液压系统": ("液压站", "液压"),
     "气动系统": ("气动", "气缸系统"),
+    # --- 2026-09-26 扩库新增的三个设备 ---
+    # 「风机」/「锅炉」/「冷却塔」会被 jieba 切成整词（不会降级成「风机」之外的短词），
+    # 用户写法又极不统一（"引风机""送风机""鼓风机"都是同一台机器在不同工位的叫法），
+    # 不补同义词就会出现"库里明明有、却因换了个叫法而误降级"。
+    # 「冷却塔」尤其要补：「制冷机组」的别名已在上面，用户把冷却塔报成「冷却塔系统」时
+    # 只剩「冷却」可用，而那是**确无指向性**的泛词，靠它命中等于没护栏。
+    "离心风机": ("风机", "引风机", "送风机", "鼓风机", "罗茨风机"),
+    "工业锅炉": ("锅炉", "蒸汽锅炉", "热水锅炉"),
+    "冷却塔": ("凉水塔", "冷却水塔"),
 }
 
 
+# 设备名里几乎必然出现、但**不指向任何具体设备**的词。
+#
+# 这些词是"单 token OR"漏洞的主要来源：离线探针实测（8 类设备 × 全部跨设备条目），
+# 旧实现的 21 次跨设备误放行里有 **14 次**只靠「系统」蒙混过关 ——
+# 「液压系统」的 token 里有「系统」，而任何一份资料都可能写着"冷却系统""控制系统"。
+# 「机床」则相反：它是「数控机床」在 `t[:2]` 降级后唯一的可用词，
+# 而数控机床章节的标题写的是"主轴电机"、正文也只在个别地方提"机床"，
+# 一旦把它也拉黑，旗舰用例（数控机床 E-203）会被误判成"无依据"。
+# 所以黑名单只收**确定没有指向性**的词，宁少勿多。
+_GENERIC_DEVICE_TOKENS = frozenset({
+    "系统", "设备", "装置", "机器", "机构", "部件", "组件", "生产线",
+})
+
+
 def _equipment_tokens(device: str) -> list:
-    """设备类型的分词结果（含同义词展开），用于与检索资料比对。"""
+    """设备类型的分词结果（含同义词展开），用于与检索资料比对。
+
+    `t[:2]` 降级是有意保留的：它让「龙门加工中心」这类带前缀的写法仍能命中
+    「加工中心」的同义词族，也让「数控机床」在 `jieba` 只切出一个词时
+    还能提供「数控」「机床」两个抓手。它带来的"泛词混入"由
+    `_GENERIC_DEVICE_TOKENS` 在判定处过滤，而不是在这里删掉。
+    """
     tokens = [t for t in jieba.cut(device) if len(t) >= 2]
     expanded = list(tokens)
     for token in tokens:
@@ -695,11 +865,24 @@ def _equipment_tokens(device: str) -> list:
 def is_equipment_in_evidence(fault_info: dict, evidence: str) -> bool:
     """确定性护栏：抽取出的设备类型/报警代码若未出现在检索资料中，直接判定无依据。
 
-    设备类型比对走 `_equipment_tokens` 做同义词展开。此前是裸的精确子串比对，
-    遇到"用户说空气压缩机、知识库写空压机"这类**同义不同名**就会误判无依据，
-    把一个本来能答的案例降级掉（README 指标⑦ 误降级）。
-    这个问题在知识库只有 3 个主题时暴露不出来——那时"空压机"只出现在对抗案例里，
-    误降级与正确的降级长得一模一样。扩库后它才浮出水面。
+    设备类型比对走 `_equipment_tokens` 做同义词展开，但**先滤掉泛词**
+    （`_GENERIC_DEVICE_TOKENS`）。
+
+    为什么必须滤：旧实现是"任一 token 命中即放行"，而「系统」这类词几乎在任何
+    设备资料里都能命中，护栏于是形同虚设。离线探针实测（8 类设备 × 全部跨设备条目，
+    327 组）：无报警代码时跨设备证据被放行 **6.4%**，其中 14/21 次只靠「系统」过关；
+    滤掉泛词后降到 **1.5%**。
+
+    为什么不用更严的规则（例如"必须两个 token 同时命中"）：数控机床章节的标题写的是
+    「一、主轴电机报警代码E-203」，正文也不提「数控」——过严的规则会把
+    **同设备**的条目判成"无依据"。离线探针实测：更严的规则会把 33 条同设备条目
+    里的 12 条拦下（旧实现是 10 条），等于把旗舰用例的误降级率推高。
+    泛词黑名单在"拦下跨设备"与"不误伤同设备"之间给出了更好的折中。
+
+    历史：此前是裸的精确子串比对，遇到"用户说空气压缩机、知识库写空压机"这类
+    **同义不同名**就会误判无依据（README 指标⑦ 误降级）。这个问题在知识库只有
+    3 个主题时暴露不出来——那时"空压机"只出现在对抗案例里，误降级与正确的降级
+    长得一模一样。扩库后它才浮出水面。
     """
     if "【知识库无相关依据】" in evidence:
         return False
@@ -714,7 +897,9 @@ def is_equipment_in_evidence(fault_info: dict, evidence: str) -> bool:
 
     device = fault_info.get("设备类型") or ""
     if device:
-        tokens = _equipment_tokens(device)
+        tokens = [
+            t for t in _equipment_tokens(device) if t not in _GENERIC_DEVICE_TOKENS
+        ]
         if tokens and not any(t in evidence for t in tokens):
             return False
 
@@ -1068,19 +1253,25 @@ def _exclusion_tokens(text: str) -> set:
     }
 
 
-def _deterministic_exclusion_hits(exclusion_list: list, kb_entries: list, scope: list) -> list:
-    """用 token 重叠把排除描述确定性地映射到知识库条目编号（0 基）。
+def _deterministic_exclusion_map(exclusion_list: list, kb_entries: list, scope: list) -> Tuple[list, list]:
+    """逐条排除项做确定性映射。
 
-    与 LLM 映射取并集使用。判据是**逐条排除项**各自的最佳匹配：
-    每条排除描述至少绑一条原因条目，避免"某条排除项整体被漏掉"。
-    要求命中 token 数 > 0 即可，不设比例阈值——排除描述（如"电缆护套完好"）
-    与原因条目（"动力电缆在桥架转弯处磨损露出导体"）共用词往往只有一个，
-    按比例卡会全部漏掉，而漏排除正是这里要修的问题。
+    返回 ``(命中的知识库条目编号列表, 没能命中任何条目的排除项下标列表)``。
+
+    第二项是"要不要叫 LLM"的判据：只有当**还有排除项没有确定性命中**时才值得
+    花一次 LLM 调用。全部都能确定性映射时再调一次，是对同一份输入白花钱。
+
+    判据必须是"每一条都有命中"而不是"有命中就行"——后者会让某条排除项被整体漏掉，
+    而漏排除正是这里要修的问题（排除条件是用户的硬约束）。
     """
-    hits = []
-    for excl in exclusion_list:
+    hits: list = []
+    unmatched: list = []
+    for pos, excl in enumerate(exclusion_list):
         excl_tokens = _exclusion_tokens(excl)
         if not excl_tokens:
+            # 一个有效 token 都没有（如"正常"这类被停用词吃光的短句）：
+            # 确定性通道帮不上忙，交给 LLM 看原文。
+            unmatched.append(pos)
             continue
         best_i, best_hit = -1, 0
         for i in scope:
@@ -1090,11 +1281,35 @@ def _deterministic_exclusion_hits(exclusion_list: list, kb_entries: list, scope:
                 best_hit, best_i = hit, i
         if best_i != -1:
             hits.append(best_i)
+        else:
+            unmatched.append(pos)
+    return hits, unmatched
+
+
+def _deterministic_exclusion_hits(exclusion_list: list, kb_entries: list, scope: list) -> list:
+    """用 token 重叠把排除描述确定性地映射到知识库条目编号（0 基）。
+
+    与 LLM 映射取并集使用。判据是**逐条排除项**各自的最佳匹配：
+    每条排除描述至少绑一条原因条目，避免"某条排除项整体被漏掉"。
+    要求命中 token 数 > 0 即可，不设比例阈值——排除描述（如"电缆护套完好"）
+    与原因条目（"动力电缆在桥架转弯处磨损露出导体"）共用词往往只有一个，
+    按比例卡会全部漏掉，而漏排除正是这里要修的问题。
+    """
+    hits, _ = _deterministic_exclusion_map(exclusion_list, kb_entries, scope)
     return hits
 
 
 def map_excluded_causes(exclusion_list: list, kb_entries: list, scope: list = None, correlation_id: str = None) -> list:
     """排除映射器：把用户排除描述映射到知识库原因条目编号。
+
+    **顺序是先确定性、后 LLM**：确定性命中的编号先算出来；只有当**还有排除项
+    没有确定性命中**时，才为那些漏网的排除项花一次 LLM 调用。
+
+    此前是反过来的（无条件先叫 LLM，再与确定性结果取并集）。从库里
+    `token_usage.by_node` 看，诊断与每轮辩论各调一次这个映射，而现场报修里
+    大多数排除描述（"液压油位正常"）都能被 token 重叠直接命中 —— 那些调用纯属白花。
+    反转后并集语义不变：命中项由确定性通道保证，漏网项交给 LLM，
+    仍然"宁可多排除，不可漏排除"。
 
     带进程内结果缓存：诊断与辩论阶段会各调一次，而辩论阶段的证据常常与初诊相同
     （重新检索命中的还是那几条），没有缓存就会对同一份输入白花一次 LLM 调用。
@@ -1114,10 +1329,29 @@ def map_excluded_causes(exclusion_list: list, kb_entries: list, scope: list = No
         logger.info("exclusion_mapped_cache_hit", correlation_id=correlation_id)
         return list(cached)
 
+    det_hits, unmatched = _deterministic_exclusion_map(exclusion_list, kb_entries, scope)
+
+    if not unmatched:
+        # 每条排除项都确定性命中：LLM 只会重复同一份结论，没必要调。
+        idx = sorted(set(det_hits))
+        logger.info(
+            "exclusion_mapped_deterministic_only",
+            excluded_indices=idx,
+            items=len(exclusion_list),
+            correlation_id=correlation_id,
+        )
+        with _exclusion_cache_lock:
+            if len(_exclusion_cache) >= _EXCLUSION_CACHE_MAX:
+                _exclusion_cache.clear()
+            _exclusion_cache[cache_key] = list(idx)
+        return idx
+
+    # 还有排除项没能确定性映射，交给 LLM 兜底。
+    # 只把**漏网的**那些交给它（提示词更短），命中项直接并进结果，并集语义不变。
     numbered = "\n".join(f"{i + 1}. (【{kb_entries[i][0]}】) {kb_entries[i][1]}" for i in scope)
     prompt = render_prompt(
         PromptTemplates.MAP_EXCLUDED_CAUSES,
-        exclusion_list=json.dumps(exclusion_list, ensure_ascii=False),
+        exclusion_list=json.dumps([exclusion_list[i] for i in unmatched], ensure_ascii=False),
         numbered=numbered
     )
     messages = [
@@ -1141,14 +1375,15 @@ def map_excluded_causes(exclusion_list: list, kb_entries: list, scope: list = No
 
     idx = sorted({n - 1 for n in numbers if n - 1 in scope})
 
-    # 确定性补充：**始终**与 LLM 结果取并集，而不是"LLM 没返回时才兜底"。
+    # 与确定性命中取并集：LLM 只看了漏网的那几条，确定性通道负责剩下的，
+    # 合起来仍是"每条排除项至少绑一条原因条目"。
     #
-    # 此前写作 `if not idx:`，效果是 LLM 只要返回了任意编号，确定性匹配就整段跳过。
-    # 于是 LLM 漏掉一条排除项时无人补救——用户说了两条排除条件，模型只映射了一条，
-    # 另一条对应的原因就会留在根因里（README 指标④ 排除条件遵守率）。
-    # 排除条件是**用户的硬约束**，漏掉一条等于把用户明确排除的原因又写回去，
-    # 比多排除一条严重得多，所以这里取并集（宁可多排除，不可漏排除）。
-    idx = sorted(set(idx) | set(_deterministic_exclusion_hits(exclusion_list, kb_entries, scope)))
+    # 历史教训：这里曾写作 `if not idx:`，效果是 LLM 只要返回了任意编号，
+    # 确定性匹配就整段跳过。于是 LLM 漏掉一条排除项时无人补救——用户说了两条
+    # 排除条件、模型只映射了一条，另一条对应的原因就会留在根因里
+    # （README 指标④ 排除条件遵守率）。排除条件是**用户的硬约束**，
+    # 漏掉一条等于把用户明确排除的原因又写回去，比多排除一条严重得多。
+    idx = sorted(set(idx) | set(det_hits))
 
     logger.info("exclusion_mapped", excluded_indices=idx, correlation_id=correlation_id)
 
@@ -1777,11 +2012,30 @@ def _assert_degraded_markers_in_sync() -> None:
     )
 
 
-def agent_review_final(original_diagnosis: dict, rebuttal: dict, correlation_id: str = None) -> dict:
+def agent_review_final(original_diagnosis: dict, rebuttal: dict, correlation_id: str = None,
+                       evidence: str = "", disagreements: list = None) -> dict:
+    """最终复审。
+
+    `evidence` / `disagreements` 是与初审（agent_review）同源的**对照物**，
+    必须传给终审。原因：终审才是决定终态的那一步，而它此前只看得到
+    「原诊断 + 反驳」两样东西——对照物比初审还少。初审刚被补上
+    evidence/fault/disagreements 时是为了"让辩论点得着"，结果终审反而退化成
+    "看两边谁说得更顺"：**结论里的原因有没有出处**、**知识库里是不是本来就两派意见**，
+    这两项在终审阶段根本无从检查。
+
+    新参数放在 `correlation_id` 之后而不是之前：历史调用点与测试里的桩
+    可能按位置传第三个参数，插在中间会把 correlation_id 顶到 evidence 上。
+
+    `disagreements` 不传时从 evidence 现算，与 agent_review 口径一致。
+    """
+    if disagreements is None:
+        disagreements = extract_kb_disagreements(evidence)
     prompt = render_prompt(
         PromptTemplates.AGENT_REVIEW_FINAL,
         original_diagnosis=json.dumps(original_diagnosis, ensure_ascii=False, indent=2),
-        rebuttal=json.dumps(rebuttal, ensure_ascii=False, indent=2)
+        rebuttal=json.dumps(rebuttal, ensure_ascii=False, indent=2),
+        evidence=evidence or "（未提供检索资料）",
+        disagreements=_format_disagreements(disagreements),
     )
     messages = [
         SystemMessage(content="你是严格的维修安全审核员，正在进行最终复审。"),
@@ -1969,10 +2223,57 @@ def generate_followup_question(fault_info: dict) -> str:
 
 # ========== 多模态 ==========
 
+# 图片 MIME 的保守默认值：认不出来时按 JPEG 处理（视觉服务大多能容忍）。
+_DEFAULT_IMAGE_MIME = "image/jpeg"
+
+# 魔数 → MIME。顺序有意义：PNG 的魔数最长，必须先判。
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF8", "image/gif"),
+)
+
+
+def detect_image_mime(image_base64: str) -> str:
+    """按**魔数**判断图片类型，认不出时回退 JPEG。
+
+    此前是硬编码 `data:image/jpeg`，而前端（`app.py` / DiagnosePage）都允许上传 png。
+    PNG 的字节流被贴上 jpeg 标签后，部分视觉服务会直接拒收，或按 jpeg 解析出
+    一张坏图 —— 而**用户完全不知道**，因为失败被静默成了空描述。
+
+    为什么不信任文件名或浏览器给的 `File.type`：两者都是调用方可任意填写的元数据，
+    与字节流是否一致没有任何保证。魔数是唯一可靠来源。
+    """
+    try:
+        # 取前 16 个 base64 字符（= 12 字节），足够覆盖上面所有魔数，
+        # 且 16 是 4 的整数倍，不需要补 padding。
+        head = base64.b64decode(image_base64[:16], validate=False)
+    except Exception:
+        return _DEFAULT_IMAGE_MIME
+
+    for magic, mime in _IMAGE_MAGIC:
+        if head.startswith(magic):
+            return mime
+    # WebP 是 RIFF 容器，需要再看第 8~12 字节
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
+
+    return _DEFAULT_IMAGE_MIME
+
+
 def extract_image_info(image_base64: str, correlation_id: str = None) -> str:
+    """识别图片内容。**返回空串表示没识别出来**（调用方必须显式处理）。
+
+    返回值刻意不抛异常：图片识别是可选增强，不该因为一次视觉调用失败就把整条诊断
+    打成"模型服务异常"。但"静默返回空串"同样是错的——用户传了照片，
+    结果整轮只按文字诊断，而界面上没有任何提示，他会以为照片被用上了。
+    所以调用方（`orchestrator._build_initial_state`）要把空返回值转成
+    `image_warning` 带出去。
+    """
     from langchain_core.messages import HumanMessage as HM
 
     prompt_text = render_prompt(PromptTemplates.EXTRACT_IMAGE_INFO)
+    mime = detect_image_mime(image_base64)
 
     messages = [
         SystemMessage(content="你是工业设备故障图片分析专家。"),
@@ -1983,10 +2284,12 @@ def extract_image_info(image_base64: str, correlation_id: str = None) -> str:
             },
             {
                 "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
+                "image_url": {"url": f"data:{mime};base64,{image_base64}"}
             }
         ])
     ]
 
     content = safe_llm_invoke(messages, llm=get_vision_llm(), correlation_id=correlation_id)
+    if not content:
+        logger.warning("image_extract_failed", mime=mime, correlation_id=correlation_id)
     return content or ""

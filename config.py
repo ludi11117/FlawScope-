@@ -129,6 +129,18 @@ class Settings(BaseSettings):
         ge=1000,
         description="单张图片 base64 字符串长度上限（约 6MB 原图）。此前该字段无上限，超大请求可打爆内存与配额"
     )
+    RETRIEVAL_DEVICE_FILTER: bool = Field(
+        default=False,
+        description=(
+            "检索时是否按设备 metadata 过滤。**默认关闭**，三个理由："
+            "① 现有 chroma_db 是没写 metadata 的旧库，开启会直接查不到东西 → 召回为空 → 误降级；"
+            "② 一刀切过滤有真实风险——用户写「空压机」而库里章节名是「空气压缩机」时，"
+            "本来能召回的证据会被整段滤掉；"
+            "③ 更合适的形态是「降级前的二次尝试」（先不带过滤检索，为空或不匹配时再带过滤重试），"
+            "而那会牵动误降级指标，需要先做产品决策。"
+            "开启前必须先用 build_knowledge_base.py 重建向量库以写入 metadata"
+        )
+    )
     CORS_ALLOW_ORIGINS: list = Field(
         default=[
             "http://localhost:5173",

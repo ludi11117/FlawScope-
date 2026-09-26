@@ -69,6 +69,86 @@ def _count(db: Chroma) -> int:
         return -1
 
 
+# 设备章节标题形如「【数控机床主轴电机常见故障与排查】」，
+# 去掉这个后缀就是设备名（与 `_SECTION_START` 的正则保持一致）。
+_SECTION_SUFFIX = "常见故障与排查"
+_SECTION_TITLE = re.compile(r"^【(.+?)】\s*$", re.MULTILINE)
+_CHAPTER_TITLE = re.compile(r"^[一二三四五六七八九十]+、\s*(.+)$", re.MULTILINE)
+_ALARM_CODE = re.compile(r"([A-Za-z]-\d{3})")
+
+
+def _device_of(section_title: str) -> str:
+    name = section_title
+    if name.endswith(_SECTION_SUFFIX):
+        name = name[: -len(_SECTION_SUFFIX)]
+    return name.strip()
+
+
+def parse_chunk_metadata(chunks: list, body: str) -> list:
+    """给每个块补上来源 metadata：``{section, chapter, alarm, device}``。
+
+    **不改动切分本身**。做法是按位置回溯：`RecursiveCharacterTextSplitter` 的输出
+    保持原文顺序，所以从前往后找每个块在原文里的起点（游标只前进，重叠的块也能
+    正确定位），再取它之前最近的一个设备章节标题与条目标题即可。块边界与以前
+    逐字节相同，只是给已有的块补上"它来自哪"。
+
+    为什么需要它：没有 metadata 时，`retrieve_evidence` 既无法按设备过滤，
+    也无法把命中块溯源到"哪个设备 / 哪条原因"——README 把"条目级切分"列为待办，
+    而 metadata 是它的前置条件。也给 C1 那条设备护栏留了条比"词面匹配"更硬的退路。
+
+    字段说明：
+      - `section`：设备章节标题（【…常见故障与排查】那一行）。**只有这里**才一定
+        含设备名——数控机床章节的条目标题写的是"主轴电机"。
+      - `chapter`：条目标题（「一、…」）。README 的"条目级切分"要用它。
+        任务书只列了三个键，这是额外的一个；不加它就得在检索层重新解析文本。
+      - `alarm`：条目标题里的报警代码，没有则为空串。
+      - `device`：设备名（章节标题去掉后缀）。
+    """
+    metadatas = []
+    cursor = 0
+    for chunk in chunks:
+        idx = body.find(chunk, cursor)
+        if idx < 0:
+            # 找不到就退回"从当前位置往前看"：宁可 metadata 粗一点，
+            # 也不能让整个构建过程挂掉（构建失败比字段不准严重得多）。
+            idx = cursor
+        cursor = idx + 1
+
+        # 先看块**自己开头**有没有标题。块边界常常正好切在标题之前，
+        # 此时标题不在 `body[:idx]` 里，但它是这一块自己的来源。
+        head_section = _SECTION_TITLE.match(chunk)
+        head_chapter = _CHAPTER_TITLE.match(chunk)
+
+        prefix = body[:idx]
+        if head_section:
+            section_title = head_section.group(1).strip()
+            # 章节头那一块不属于任何条目
+            chapter_title = ""
+        else:
+            last_section = None
+            for last_section in _SECTION_TITLE.finditer(prefix):
+                pass
+            section_title = last_section.group(1).strip() if last_section else ""
+
+            if head_chapter:
+                chapter_title = head_chapter.group(1).strip()
+            else:
+                last_chapter = None
+                for last_chapter in _CHAPTER_TITLE.finditer(prefix):
+                    pass
+                chapter_title = last_chapter.group(1).strip() if last_chapter else ""
+
+        alarm_match = _ALARM_CODE.search(chapter_title)
+
+        metadatas.append({
+            "section": section_title,
+            "chapter": chapter_title,
+            "alarm": alarm_match.group(1) if alarm_match else "",
+            "device": _device_of(section_title),
+        })
+    return metadatas
+
+
 def build(dry_run: bool = False, append: bool = False, force: bool = False) -> int:
     if not KB_PATH.exists():
         print(f"找不到知识库原文：{KB_PATH}")
@@ -106,9 +186,16 @@ def build(dry_run: bool = False, append: bool = False, force: bool = False) -> i
     ).split_text(body)
     print(f"原文 {len(text)} 字符 → 正文 {len(body)} 字符 → 切分为 {len(chunks)} 块")
 
+    # 入库时写 metadata：给检索层留出"按设备/报警码过滤 + 命中块溯源"的能力。
+    # 这一步**不改变切分结果**（见 parse_chunk_metadata），所以对现有检索行为
+    # 是零影响；只是让库里的块多带几个字段。
+    metadatas = parse_chunk_metadata(chunks, body)
+    labeled = sum(1 for m in metadatas if m["section"])
+    print(f"已为 {labeled}/{len(chunks)} 块解析出来源（设备章节 / 条目 / 报警代码）")
+
     if dry_run:
         for i, chunk in enumerate(chunks[:5], start=1):
-            print(f"  [{i}] {chunk[:60]!r}")
+            print(f"  [{i}] {chunk[:60]!r}  meta={metadatas[i - 1]}")
         if len(chunks) > 5:
             print(f"  ...（其余 {len(chunks) - 5} 块省略）")
         print("--dry-run：未写入向量库，也未调用嵌入模型")
@@ -131,12 +218,12 @@ def build(dry_run: bool = False, append: bool = False, force: bool = False) -> i
     before = _count(db)
 
     if append:
-        db.add_texts(chunks)
+        db.add_texts(chunks, metadatas=metadatas)
         action = "追加"
     else:
         # 先删集合并重建空集合，再写入 —— 这样重复执行结果稳定
         db.reset_collection()
-        db.add_texts(chunks)
+        db.add_texts(chunks, metadatas=metadatas)
         action = "重建"
 
     after = _count(db)
