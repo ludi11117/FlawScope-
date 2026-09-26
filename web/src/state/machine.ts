@@ -34,6 +34,18 @@ export interface NodeMeta {
   detail: string
   /** 是否属于辩论环（可多轮），UI 上单独标识 */
   inDebateLoop?: boolean
+  /**
+   * 只在特定分支才走的节点（目前只有转人工）。
+   *
+   * 它们必须出现在 NODES 里，否则转人工时 `computeNodeStates` 找不到这个节点，
+   * 状态机视图上**没有任何节点是 active** —— 用户看到的是"卡住了"，
+   * 而实际上系统正在等他做人工复核。
+   *
+   * 但也不能算进"进度 N/M"的分母：正常链路永远走不到它，
+   * 算进去会让进度条最高只到 9/10 = 90%，看起来像没跑完。
+   * 分母用 `PRIMARY_NODES`（见下）。
+   */
+  conditional?: boolean
 }
 
 export const NODES: NodeMeta[] = [
@@ -96,12 +108,26 @@ export const NODES: NodeMeta[] = [
   },
 ]
 
+/**
+ * 转人工复核。只在审核判定结论不可自动采信时才走。
+ *
+ * index 用 `!` 而不是 `⚠️`：后端那条中断提示（"⚠️ 诊断流程异常中断，…"）
+ * 同样以 `⚠️` 开头，拿它当匹配键会把"异常中断"误判成"转人工"。
+ * 所以这个节点不做前缀匹配，由 `nodeFromLabel` 里的 `includes('人工')` 兜。
+ */
 const HUMAN_REVIEW: NodeMeta = {
   id: 'human_review',
   index: '!',
   title: '转人工复核',
   detail: '审核判定结论不可自动采信，工单已标注请勿直接执行',
+  conditional: true,
 }
+
+// 把转人工并进 NODES：状态机视图要能高亮它（见 NodeMeta.conditional 的说明）
+NODES.push(HUMAN_REVIEW)
+
+/** 正常链路会走到的节点。进度分母用它——转人工不该把 100% 拉低到 90%。 */
+export const PRIMARY_NODES: NodeMeta[] = NODES.filter((n) => !n.conditional)
 
 export function nodeById(id: NodeId): NodeMeta {
   return NODES.find((n) => n.id === id) ?? HUMAN_REVIEW

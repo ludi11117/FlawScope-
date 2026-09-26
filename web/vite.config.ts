@@ -30,7 +30,10 @@ export default defineConfig(({ mode }) => {
     },
     build: {
       outDir: 'dist',
-      sourcemap: true,
+      // 不产出 sourcemap：nginx 把 /assets/ 公开托管，`sourcemap: true` 等于
+      // 把完整的 TypeScript 源码（含注释里的设计取舍与内部端点）一并发布出去。
+      // 需要调试线上问题时，本地 `npm run build` 出带 map 的产物即可。
+      sourcemap: false,
     },
   }
 })

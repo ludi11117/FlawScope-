@@ -10,13 +10,33 @@ import type {
   DiagnosisResult,
   ProgressEvent,
   RecordListResponse,
-  DiagnosisRecord,
   Stats,
 } from '../types/contracts'
 import type { HealthPayload, ReadyPayload } from './health'
+import type { StatusMetaPayload } from './statusMeta'
 import { splitSSEBuffer, parseSSEBlock } from './sse'
+import { extractDetail } from './errorDetail'
 
 const BASE = '/api'
+
+/**
+ * 普通请求的超时。诊断本身走 SSE（几十秒是正常的），但历史/统计/探活这些
+ * 请求正常都在毫秒级；给 15 秒足够宽松，同时保证"卡住"最终会变成"失败"。
+ * 没有超时的话，后端线程池被诊断占满时页面会一直转圈，用户读不出原因。
+ */
+export const REQUEST_TIMEOUT_MS = 15_000
+
+/**
+ * SSE 的「静默无 chunk」超时。
+ *
+ * 注意语义：**不是**整个请求的总超时——一次诊断跑几分钟都可能，按总时长掐会误杀。
+ * 这里量的是"两个 chunk 之间隔了多久"。后端最慢的节点（反驳）约 15 秒，
+ * 60 秒没有任何新事件只可能是连接被挂住了。
+ */
+export const SSE_SILENT_TIMEOUT_MS = 60_000
+
+/** 流结束却从未收到 result 时的兜底文案。抽成常量便于测试断言。 */
+export const STREAM_INCOMPLETE_MESSAGE = '连接中断，未收到诊断结果'
 
 /**
  * 带上 API Key（若配置了）。
@@ -36,22 +56,40 @@ export class ApiError extends Error {
     super(message)
     this.name = 'ApiError'
   }
-
-  /** 503 + Retry-After 表示"系统忙"，与真正的失败要区分开——前者重试有用。 */
-  get isOverloaded(): boolean {
-    return this.status === 503
-  }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const resp = await fetch(`${BASE}${path}`, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...authHeaders(),
-      ...(init?.headers ?? {}),
-    },
-  })
+  // 自带超时控制器；同时兼容调用方传入的 signal（历史页翻页会用，
+  // 用来丢弃过期响应）。两者任一触发都中断本次请求。
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  const external = init?.signal ?? null
+  const onExternalAbort = () => controller.abort()
+  external?.addEventListener('abort', onExternalAbort)
+
+  let resp: Response
+  try {
+    resp = await fetch(`${BASE}${path}`, {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+        ...(init?.headers ?? {}),
+      },
+    })
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') {
+      // 调用方主动取消（如翻页竞态）不该被当成错误抛给用户，原样抛出 AbortError，
+      // 由调用方识别；超时则必须转成可读的错误。
+      if (external?.aborted) throw err
+      throw new ApiError(`请求超时（${REQUEST_TIMEOUT_MS / 1000} 秒）`, 408)
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+    external?.removeEventListener('abort', onExternalAbort)
+  }
 
   if (!resp.ok) {
     // 503 的 Retry-After 是后端并发闸门给的，要带出来让 UI 能提示"X 秒后重试"
@@ -59,7 +97,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     let detail = `请求失败（HTTP ${resp.status}）`
     try {
       const body = await resp.json()
-      if (body?.detail) detail = body.detail
+      // 422 的 detail 是数组。直接赋值会让 error 变成对象，渲染时报错。
+      detail = extractDetail(body) ?? detail
     } catch {
       // 响应体不是 JSON，保留默认文案
     }
@@ -69,29 +108,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await resp.json()) as T
 }
 
-export function diagnoseSync(payload: DiagnosisRequest): Promise<DiagnosisResult> {
-  return request<DiagnosisResult>('/diagnose', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  })
-}
-
-export function listRecords(params: {
-  keyword?: string
-  status?: string
-  limit?: number
-  offset?: number
-}): Promise<RecordListResponse> {
+export function listRecords(
+  params: {
+    keyword?: string
+    status?: string
+    limit?: number
+    offset?: number
+  },
+  signal?: AbortSignal,
+): Promise<RecordListResponse> {
   const qs = new URLSearchParams()
   if (params.keyword) qs.set('keyword', params.keyword)
   if (params.status) qs.set('status', params.status)
   qs.set('limit', String(params.limit ?? 20))
   qs.set('offset', String(params.offset ?? 0))
-  return request<RecordListResponse>(`/records?${qs}`)
-}
-
-export function getRecord(id: number): Promise<DiagnosisRecord> {
-  return request<DiagnosisRecord>(`/records/${id}`)
+  return request<RecordListResponse>(`/records?${qs}`, { signal })
 }
 
 export function deleteRecord(id: number): Promise<{ message: string }> {
@@ -100,6 +131,16 @@ export function deleteRecord(id: number): Promise<{ message: string }> {
 
 export function getStats(): Promise<Stats> {
   return request<Stats>('/stats')
+}
+
+/**
+ * 状态值的口径（标签 / 是否终态 / 是否落库 / 是否可追问）。
+ *
+ * 后端是唯一来源（`status_meta.py`），前端启动时拉一次覆盖内置兜底，
+ * 避免两边各抄一份标签。见 `api/statusMeta.ts`。
+ */
+export function getStatusMeta(): Promise<StatusMetaPayload> {
+  return request<StatusMetaPayload>('/meta/statuses')
 }
 
 /**
@@ -176,6 +217,31 @@ export function diagnoseStream(
 ): () => void {
   const controller = new AbortController()
 
+  // 流有没有"交代"。收到 result 或 error 才算有；只有 done 不算——
+  // 服务端总是先发 result 再发 done，收到 done 却没有 result 说明中间被丢了。
+  let sawResult = false
+  let sawError = false
+
+  // 静默超时定时器：每个 chunk 到达就重新计时。
+  let silentTimer: ReturnType<typeof setTimeout> | null = null
+  const clearSilent = () => {
+    if (silentTimer !== null) {
+      clearTimeout(silentTimer)
+      silentTimer = null
+    }
+  }
+  const armSilent = () => {
+    clearSilent()
+    silentTimer = setTimeout(() => {
+      silentTimer = null
+      // 不主动断开的话，前端会永远停在"诊断中"：reader.read() 不会返回，
+      // running 永远是 true，用户只能刷新页面。
+      controller.abort()
+      sawError = true
+      handlers.onError?.(`连接静默超过 ${SSE_SILENT_TIMEOUT_MS / 1000} 秒，已中断本次诊断`)
+    }, SSE_SILENT_TIMEOUT_MS)
+  }
+
   void (async () => {
     let resp: Response
     try {
@@ -200,12 +266,22 @@ export function diagnoseStream(
       let detail = `请求失败（HTTP ${resp.status}）`
       try {
         const body = await resp.json()
-        if (body?.detail) detail = body.detail
+        detail = extractDetail(body) ?? detail
       } catch {
         /* 保留默认文案 */
       }
       if (retryAfter) detail += `（建议 ${retryAfter} 秒后重试）`
       handlers.onError?.(detail)
+      return
+    }
+
+    // 校验 Content-Type：反向代理出错时会返回 HTML 200（错误页），
+    // 把它当事件流读，用户看到的是一条没有任何解释的"诊断中"。
+    const contentType = resp.headers.get('content-type') ?? ''
+    if (!contentType.includes('text/event-stream')) {
+      handlers.onError?.(
+        `后端返回的不是事件流（Content-Type: ${contentType || '未提供'}），请检查反向代理配置`,
+      )
       return
     }
 
@@ -220,36 +296,49 @@ export function diagnoseStream(
     // 也可能一个 chunk 里含多条消息。按 chunk 直接解析是最常见的 SSE 实现错误。
     let buffer = ''
 
+    const handle = (block: string) => {
+      const ev = dispatchSSEBlock(block, handlers)
+      if (ev === 'result') sawResult = true
+      else if (ev === 'error') sawError = true
+    }
+
     try {
+      armSilent()
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
+        armSilent()
         buffer += decoder.decode(value, { stream: true })
 
         // 用可测的纯函数切分：一个消息可能跨 chunk，一个 chunk 也可能含多条消息。
         // 最后一段可能被切断，留在 buffer 里等下一个 chunk（见 splitSSEBuffer 的说明）。
         const { blocks, rest } = splitSSEBuffer(buffer)
         buffer = rest
-        for (const block of blocks) {
-          dispatchSSEBlock(block, handlers)
-        }
+        for (const block of blocks) handle(block)
       }
 
       // 流结束后 buffer 里若还有残留（后端未以空行结尾），补处理一次
-      if (buffer.trim()) dispatchSSEBlock(buffer, handlers)
+      if (buffer.trim()) handle(buffer)
+
+      // 流正常关闭但从未给出结果：必须显式报错。
+      // 否则 reducer 的 running 永远为 true，界面僵死在"诊断中"。
+      if (!sawResult && !sawError) handlers.onError?.(STREAM_INCOMPLETE_MESSAGE)
     } catch (err) {
       if ((err as Error).name !== 'AbortError') {
         handlers.onError?.(`读取响应流失败：${(err as Error).message}`)
       }
+    } finally {
+      clearSilent()
     }
   })()
 
   return () => controller.abort()
 }
 
-function dispatchSSEBlock(block: string, handlers: StreamHandlers): void {
+/** 处理一个 SSE 消息块，返回它的事件名（便于调用方判断是否收到终态）。 */
+function dispatchSSEBlock(block: string, handlers: StreamHandlers): string | null {
   const parsed = parseSSEBlock(block)
-  if (!parsed) return
+  if (!parsed) return null
 
   let payload: unknown
   try {
@@ -257,7 +346,7 @@ function dispatchSSEBlock(block: string, handlers: StreamHandlers): void {
   } catch {
     // 单条消息解析失败不应终止整个流，但必须让调用方知道
     handlers.onError?.(`无法解析服务端事件（${parsed.event}）`)
-    return
+    return parsed.event
   }
 
   switch (parsed.event) {
@@ -276,4 +365,5 @@ function dispatchSSEBlock(block: string, handlers: StreamHandlers): void {
     default:
       break
   }
+  return parsed.event
 }

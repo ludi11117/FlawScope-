@@ -6,16 +6,34 @@
  * 待验证这条链路稳定后再迁（避免一次替换太多导致回归面失控）。
  */
 
-import { useCallback, useRef, useState } from 'react'
-import { useDiagnosisStream } from '../hooks/useDiagnosisStream'
+import { useCallback, useRef, useState, type CSSProperties } from 'react'
+import type { DiagnosisStreamApi } from '../hooks/useDiagnosisStream'
 import { useHealth } from '../hooks/useHealth'
 import { StateMachineView } from '../components/StateMachineView'
 import { ResultView } from '../components/ResultView'
 import { workorderUrl } from '../api/client'
 import { readyWarnings, startupHint } from '../api/health'
 import { btnStyle } from '../ui/button'
+import { MAX_PAYLOAD_CHARS } from '../hooks/diagnosisContext'
 
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024
+
+/**
+ * 仅供读屏软件的标签样式。
+ * 输入框必须有可访问名，但视觉上这里是"大卡片里一段没有边框的文字"，
+ * 加一个可见的 label 会破坏版式，所以用视觉隐藏而不是省略标签。
+ */
+const SR_ONLY: CSSProperties = {
+  position: 'absolute',
+  width: 1,
+  height: 1,
+  padding: 0,
+  margin: -1,
+  overflow: 'hidden',
+  clip: 'rect(0 0 0 0)',
+  whiteSpace: 'nowrap',
+  border: 0,
+}
 
 /** 示例故障描述：新用户不知道该输入什么，直接给几条可点的样板 */
 const SAMPLES: { label: string; text: string }[] = [
@@ -37,8 +55,10 @@ const SAMPLES: { label: string; text: string }[] = [
   },
 ]
 
-export function DiagnosePage() {
-  const { state, start, abort, reset, buildContext } = useDiagnosisStream()
+export function DiagnosePage({ diagnosis }: { diagnosis: DiagnosisStreamApi }) {
+  // 诊断状态由 App 持有并透传：切到历史/统计页时本组件会被卸载，
+  // 若状态随组件走，跑了一半的诊断与已拿到的结果都会丢。
+  const { state, start, abort, reset } = diagnosis
   // 这里用的是与顶栏**同一个 hook 的独立实例**：组件各持一份状态，
   // 但两者探的是同一个端点、间隔规则一致，不会出现"顶栏说好了、按钮还灰着"。
   // 没有提到 App 用 context 下发，是因为只有两个消费点，
@@ -72,12 +92,11 @@ export function DiagnosePage() {
     const text = input.trim()
     if (!text) return
     if (blocked) return
-    // 多轮追问时把历史上下文拼进去，与 Streamlit 版行为一致。
-    // 后端每次请求都是无状态的，上下文只能由前端累积。
-    const ctx = buildContext()
-    const payload = ctx ? `${ctx}\n\n【本轮补充】${text}` : text
-    start(payload, imageBase64)
-  }, [input, imageBase64, start, buildContext, blocked])
+    // 多轮追问的上下文由 start() 内部临时组装（见 hooks/diagnosisContext.ts）。
+    // 这里只传用户原话：把拼好的上下文再传进去会让 turns 存下它，
+    // 下一轮又套一层「第N轮：」，长度指数增长直至撞上后端 4000 字上限。
+    start(text, imageBase64)
+  }, [input, imageBase64, start, blocked])
 
   const workorderRecordId = state.result?.record_id ?? null
   const showWorkorderHint =
@@ -195,12 +214,20 @@ export function DiagnosePage() {
           transition: 'border-color var(--transition), box-shadow var(--transition)',
         }}
       >
+        <label htmlFor="fault-input" style={SR_ONLY}>
+          故障描述
+        </label>
         <textarea
+          id="fault-input"
+          aria-describedby="fault-input-counter"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder="描述故障现象，例如：那台数控机床主轴转起来一顿一顿的，还有怪声，温度也高得离谱"
           rows={4}
           disabled={state.running}
+          // 上限与后端 DiagnosisRequest.fault_description 的 max_length 一致。
+          // 不设的话，用户在输入框里写超长文本，点下去只会拿到一个 422。
+          maxLength={MAX_PAYLOAD_CHARS}
           style={{
             width: '100%',
             boxSizing: 'border-box',
@@ -214,6 +241,25 @@ export function DiagnosePage() {
             color: 'var(--color-text-primary)',
           }}
         />
+
+        {/* 实时字数：只在接近上限时才提示。一直显示数字会变成噪音，
+            而用户真正需要知道"快满了"的时刻，正是他快写超的时候。 */}
+        {input.length > MAX_PAYLOAD_CHARS * 0.8 && (
+          <div
+            id="fault-input-counter"
+            style={{
+              fontSize: 11.5,
+              textAlign: 'right',
+              color:
+                input.length >= MAX_PAYLOAD_CHARS
+                  ? 'var(--danger)'
+                  : 'var(--color-text-tertiary)',
+            }}
+          >
+            {input.length} / {MAX_PAYLOAD_CHARS}
+            {input.length >= MAX_PAYLOAD_CHARS && '（已达上限，超出部分不会被发送）'}
+          </div>
+        )}
 
         {/* 示例快捷入口：只在还没开始输入时出现，避免干扰正式使用 */}
         {!input && !state.running && (
@@ -410,6 +456,27 @@ export function DiagnosePage() {
               系统当前并发已满（这是保护机制，不是你的请求有问题），建议 {state.retryAfter} 秒后重试。
             </div>
           )}
+        </div>
+      )}
+
+      {/* 图片未识别提示。传了照片却只按文字诊断，用户必须能看出来——
+          否则他会以为照片被用上了，把结论当成"看过照片"得出的。 */}
+      {state.result?.image_warning && (
+        <div
+          className="fs-banner fs-rise"
+          data-testid="image-warning"
+          style={{
+            padding: '11px 14px',
+            borderRadius: 'var(--radius-md)',
+            background: 'var(--warning-soft)',
+            border: '0.5px solid var(--warning)',
+            color: '#633806',
+            fontSize: 13,
+            lineHeight: 1.6,
+            marginBottom: 16,
+          }}
+        >
+          {state.result.image_warning}
         </div>
       )}
 

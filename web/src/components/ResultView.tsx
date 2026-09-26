@@ -15,7 +15,17 @@ interface Props {
   result: DiagnosisResult
 }
 
-/** 状态 → 中文说明 + 配色。与 app.py 的状态横幅口径保持一致。 */
+/**
+ * 状态 → 中文说明 + 配色。
+ *
+ * ⚠️ 这里的文案**故意比列表里的长**（列表用 `historyUtils.STATUS_META` 的短标签，
+ * 例如「知识库无依据」；这里写「知识库无相关依据，无法自动诊断」）——
+ * 结果横幅是用户看到最终结论的地方，多一句"无法自动诊断"能省掉一次困惑。
+ *
+ * 因此它**不消费** `GET /meta/statuses` 的 label（那会把长文案覆盖成短标签）。
+ * 需要防的是"状态集合漂移"（后端加了状态、前端不认 → 显示成未知），
+ * 那由 `tests/test_status_meta.py` 的集合比对守着。
+ */
 const STATUS_META: Record<
   string,
   { label: string; bg: string; border: string; text: string; icon: string }

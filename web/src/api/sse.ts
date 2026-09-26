@@ -27,7 +27,12 @@ export function splitSSEBuffer(buffer: string): {
   blocks: string[]
   rest: string
 } {
-  const parts = buffer.split('\n\n')
+  // 用正则而不是 `split('\n\n')`：某些反向代理会把换行改写成 CRLF，
+  // 此时 `'\n\n'` 切不出任何完整消息 —— 整条流解析不出事件，
+  // 前端表现为"进度一直不动、最后什么都没有"。
+  // 同一文件的 `parseSSEBlock` 早就专门 `replace(/\r$/, '')` 处理了行尾 CR，
+  // 只有这里没跟上，属于自相矛盾。
+  const parts = buffer.split(/\r?\n\r?\n/)
   const rest = parts.pop() ?? ''
   return { blocks: parts, rest }
 }

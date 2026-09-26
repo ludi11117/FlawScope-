@@ -141,9 +141,17 @@ export interface DiagnosisResult {
   correlation_id: string
   token_usage: TokenUsage
   /**
-   * 落库后的记录 id。仅 SSE 的 result 事件带（api.py 在落库后回填），
-   * 同步 /diagnose 接口不返回——前端拿它拼工单下载地址。
-   * 追问轮次不落库，因此这时为 null。
+   * 图片没被识别出来时的可见提示（空串 = 无需提示）。
+   * 契约来源：orchestrator.py :: `_build_initial_state` 的 `image_warning`。
+   *
+   * 视觉调用失败此前是静默的：流程照跑，用户不知道照片没被用上——
+   * "没识别出来"和"没传照片"在界面上长得一模一样。
+   */
+  image_warning?: string
+  /**
+   * 落库后的记录 id，前端拿它拼工单下载地址。
+   * 同步 /diagnose 与 SSE 的 result 事件都会带（口径已对齐）；
+   * 追问轮次不落库、或落库失败时为 null。
    */
   record_id?: number | null
 }

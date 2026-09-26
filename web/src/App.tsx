@@ -13,7 +13,9 @@ import { DiagnosePage } from './pages/DiagnosePage'
 import { HistoryPage } from './pages/HistoryPage'
 import { StatsPage } from './pages/StatsPage'
 import { useHealth } from './hooks/useHealth'
+import { useDiagnosisStream } from './hooks/useDiagnosisStream'
 import { degradedHint, HEALTH_META, startupHint } from './api/health'
+import { loadStatusMeta } from './api/statusMeta'
 
 type Route = 'diagnose' | 'history' | 'stats'
 
@@ -33,12 +35,23 @@ function parseHash(): Route {
 export function App() {
   const [route, setRoute] = useState<Route>(parseHash)
   const health = useHealth()
+  // 诊断状态挂在这一层，而不是诊断页内部。
+  // 切 tab 会卸载 DiagnosePage —— 状态若随它走，跑了一半的诊断和已拿到的结果
+  // 都会被丢掉，而后端那条 SSE 流还在继续烧 LLM 配额。
+  // 放在 App 上，切页只是"看不见"，回来还在，流也不会被误中断。
+  const diagnosis = useDiagnosisStream()
 
   // 支持浏览器前进/后退：不监听的话，用户按后退键 URL 变了但页面不切
   useEffect(() => {
     const onHashChange = () => setRoute(parseHash())
     window.addEventListener('hashchange', onHashChange)
     return () => window.removeEventListener('hashchange', onHashChange)
+  }, [])
+
+  // 拉一次状态值的口径（后端是唯一来源，见 status_meta.py）。
+  // 只拉一次、失败静默：这是文案层面的优化，不该阻塞或打扰用户。
+  useEffect(() => {
+    void loadStatusMeta()
   }, [])
 
   const go = (r: Route) => {
@@ -194,13 +207,16 @@ export function App() {
         </a>
       </nav>
 
-      <main key={route} className="fs-rise">
+      {/* 不给 main 挂 route 作 key：那会强制重挂载，而"状态在 App 上"本来就是为了
+          让切页不丢诊断，两者自相矛盾。不同页面是不同类型，React 该卸载的还是会
+          卸载，不需要 key 帮忙。 */}
+      <main className="fs-rise">
         {route === 'stats' ? (
           <StatsPage />
         ) : route === 'history' ? (
           <HistoryPage />
         ) : (
-          <DiagnosePage />
+          <DiagnosePage diagnosis={diagnosis} />
         )}
       </main>
     </div>

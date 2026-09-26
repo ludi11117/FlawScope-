@@ -12,8 +12,14 @@ WORKDIR /build
 
 # 先只拷依赖清单：只要依赖没变，这一层就能命中缓存，
 # 不必每次改源码都重装一遍 node_modules。
-COPY package.json package-lock.json* ./
-RUN npm install --no-audit --no-fund
+#
+# 用 `npm ci` 而不是 `npm install`：`ci` 严格按 package-lock.json 装，
+# 装出来的版本与本地/CI 完全一致；`install` 会顺手升级 lock 里允许的范围，
+# 于是"本地测过"和"镜像里跑的"可能是两个版本。
+# 也正因如此，lock 文件必须存在且被显式拷进来 —— 原来的 `package-lock.json*`
+# 通配符在文件缺失时会静默跳过，`npm ci` 直接报错，反而是我们想要的失败方式。
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 COPY . .
 RUN npm run build

@@ -10,6 +10,8 @@
  *      而真实原因是"页码超了"。
  */
 
+import { labelFor } from '../api/statusMeta'
+
 export interface PageWindow {
   page: number
   offset: number
@@ -59,7 +61,12 @@ export const STATUS_META: Record<
 }
 
 export function statusMeta(status: string) {
-  return STATUS_META[status] ?? { label: status || '未知', color: '#2C2C2A', bg: '#F1EFE8' }
+  const local =
+    STATUS_META[status] ?? { label: status || '未知', color: '#2C2C2A', bg: '#F1EFE8' }
+  // 标签优先用后端下发的（`GET /meta/statuses`，唯一来源见 status_meta.py），
+  // 拿不到时用上面这份内置兜底——后端没起来时界面不能变成一堆英文状态名。
+  // 配色是渲染细节，始终由前端掌握。
+  return { ...local, label: labelFor(status, local.label) }
 }
 
 /** ISO 时间串截断到秒，避免时区后缀把表格撑开。 */

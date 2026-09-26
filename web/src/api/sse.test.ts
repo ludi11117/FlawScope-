@@ -114,6 +114,48 @@ describe('splitSSEBuffer —— 跨 chunk 分片', () => {
 
     expect(events).toEqual(['progress', 'result', 'done'])
   })
+
+  it('CRLF 换行也能切出完整消息（某些代理会改写换行符）', () => {
+    // 旧实现只按 '\n\n' 切：CRLF 流里一条消息都切不出来，整条流解析不出事件，
+    // 前端表现为"进度一直不动、最后什么都没有"。
+    // 而同一文件的 parseSSEBlock 早就专门处理了行尾 CR —— 属于自相矛盾。
+    const crlf =
+      'event: progress\r\ndata: {"i":1}\r\n\r\nevent: result\r\ndata: {"status":"done"}\r\n\r\n'
+
+    const { blocks, rest } = splitSSEBuffer(crlf)
+
+    expect(blocks.length).toBe(2)
+    expect(rest).toBe('')
+    expect(blocks.map((b) => parseSSEBlock(b)?.event)).toEqual(['progress', 'result'])
+  })
+
+  it('CRLF 与 LF 混用的流也能解析（代理只改写一部分换行）', () => {
+    const mixed =
+      'event: progress\r\ndata: {"i":1}\n\nevent: done\ndata: {}\r\n\r\n'
+
+    const events = parseSSEStream(mixed)
+
+    expect(events.map((e) => e.event)).toEqual(['progress', 'done'])
+  })
+
+  it('逐字节喂入 CRLF 流同样不丢事件', () => {
+    const full =
+      'event: progress\r\ndata: {"i":1}\r\n\r\nevent: done\r\ndata: {}\r\n\r\n'
+    let buffer = ''
+    const events: string[] = []
+
+    for (const ch of full) {
+      buffer += ch
+      const { blocks, rest } = splitSSEBuffer(buffer)
+      buffer = rest
+      for (const b of blocks) {
+        const ev = parseSSEBlock(b)
+        if (ev) events.push(ev.event)
+      }
+    }
+
+    expect(events).toEqual(['progress', 'done'])
+  })
 })
 
 describe('parseSSEStream', () => {

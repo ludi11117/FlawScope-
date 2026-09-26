@@ -10,11 +10,29 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { NODES, nodeById, nodeFromLabel, computeNodeStates, type NodeId } from './machine'
+import {
+  NODES,
+  PRIMARY_NODES,
+  nodeById,
+  nodeFromLabel,
+  computeNodeStates,
+  type NodeId,
+} from './machine'
 
 describe('NODES 定义', () => {
-  it('共 9 个主节点（与 orchestrator 的节点数对齐）', () => {
-    expect(NODES.length).toBe(9)
+  it('共 10 个节点 = 9 个主节点 + 转人工', () => {
+    // 这条断言被**加强**过（原为 `NODES.length === 9`）：
+    // 转人工必须并进 NODES，否则它触发时状态机视图上没有任何 active 节点，
+    // 用户会以为卡死了（见 NodeMeta.conditional）。这里把两个数字都钉住：
+    // 总数对了但主节点数错了，同样会红。
+    expect(NODES.length).toBe(10)
+    expect(PRIMARY_NODES.length).toBe(9)
+  })
+
+  it('转人工是唯一的条件节点，且不在进度分母里', () => {
+    const conditional = NODES.filter((n) => n.conditional).map((n) => n.id)
+    expect(conditional).toEqual(['human_review'])
+    expect(PRIMARY_NODES.map((n) => n.id)).not.toContain('human_review')
   })
 
   it('序号唯一 —— 否则 nodeFromLabel 会匹配错节点', () => {
@@ -108,5 +126,14 @@ describe('computeNodeStates', () => {
     for (const n of NODES) {
       expect(states.has(n.id)).toBe(true)
     }
+  })
+
+  it('转人工时必须有一个 active 节点（否则界面看起来像卡死）', () => {
+    // 修复前 NODES 里没有 human_review，转人工时 computeNodeStates 返回的 map
+    // 里根本没有这个键，状态机视图上**没有任何节点是进行中** ——
+    // 用户看到的是"卡住了"，而系统其实在等他做人工复核。
+    const states = computeNodeStates(new Set<NodeId>(['review']), 'human_review')
+
+    expect(states.get('human_review')).toBe('active')
   })
 })

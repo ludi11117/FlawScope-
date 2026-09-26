@@ -55,23 +55,39 @@ src/
 
 ## 单元测试
 
-86 项，全部离线、不依赖后端：
+190 项，全部离线、不依赖后端：
 
 | 文件 | 项数 | 覆盖什么 |
 |---|---|---|
-| `api/sse.test.ts` | 18 | 跨 chunk 分片、多行 data、注释心跳、半截消息 |
-| `state/machine.test.ts` | 17 | 节点映射（含"不该映射"的反向用例）、状态归约 |
+| `api/health.test.ts` | 50 | 探活三态判定、失败时保留版本号、隐藏时暂停轮询 |
 | `pages/historyUtils.test.ts` | 27 | 分页夹取与 `clamped` 信号、CSV 注入防护、时间格式化 |
-| `api/health.test.ts` | 16 | 探活三态判定、失败时保留版本号、隐藏时暂停轮询 |
+| `api/sse.test.ts` | 21 | 跨 chunk 分片、多行 data、注释心跳、半截消息、**CRLF 换行** |
+| `pages/statsUtils.test.ts` | 21 | 状态分布排序与占比、空表边界 |
+| `state/machine.test.ts` | 19 | 节点映射（含"不该映射"的反向用例）、状态归约、转人工的 active 态 |
+| `hooks/diagnosisContext.test.ts` | 11 | 多轮上下文**线性增长**（不自我嵌套）、轮数与字符预算 |
+| `api/statusMeta.test.ts` | 9 | 后端状态表合并、脏载荷不崩、标签覆盖但颜色不被覆盖 |
 | `ui/button.test.ts` | 8 | 危险按钮不能红底红字（真实 bug 的回归守卫） |
+| `hooks/streamLifecycle.test.ts` | 7 | 卸载时中断在途流、接线断言（源码级） |
+| `api/errorDetail.test.ts` | 7 | 422 的数组 detail 提成可读字符串（白屏的守门人） |
+| `api/client.test.ts` | 5 | Content-Type 校验、流提前关闭兜底、422 detail |
+| `hooks/diagnosisReducer.test.ts` | 5 | error 必为字符串、`done` 让 running 收敛、turns 推进 |
 
-两个刻意的组织决定：
+> 项数用 `cd web && npm test` 核对（输出里每个文件一行）。改完测试记得回来同步这张表——
+> 它是**手抄**的，没有自动校验（后端那份有 `tools/check_doc_numbers.py`，前端暂时没有）。
 
-1. **把纯逻辑抽成独立模块**（`api/sse.ts`、`api/health.ts`、`pages/historyUtils.ts`），
-   而不是塞在组件里。组件只负责渲染，逻辑能被直接测——这不是为了凑测试数量，
-   `pageWindow` 的 `clamped` 恒假 bug 就是抽出来之后才被测到的。
+三个刻意的组织决定：
+
+1. **把纯逻辑抽成独立模块**（`api/sse.ts`、`api/health.ts`、`hooks/diagnosisContext.ts`、
+   `hooks/streamLifecycle.ts`），而不是塞在组件里。组件只负责渲染，逻辑能被直接测——
+   这不是为了凑测试数量，`pageWindow` 的 `clamped` 恒假 bug、以及多轮上下文**指数膨胀**
+   那个 bug，都是抽出来之后才被测到的。
 2. **每个"该拦的"都配"该放的"**。比如 `nodeFromLabel` 既测"转人工→human_review"，
    也测"随便一句话→null"。只测前者的话，实现退化成"永远返回第一个节点"也能通过。
+3. **没有 jsdom 时的退路是"源码接线断言"**，不是不测。`streamLifecycle.test.ts` 里
+   会读 `useDiagnosisStream.ts` / `App.tsx` / `HistoryPage.tsx` 的源码，
+   断言 `useEffect` 清理、`AbortController`、`winRef.current.offset` 确实被接上。
+   ⚠️ 这类断言**必须先剥掉注释再匹配**——第一版直接搜全文，把"被注释掉的清理"
+   也当成了接线成功（退化验证时抓出来的）。
 
 **本项目没有 jsdom 与 @testing-library**，所有测试都是纯逻辑的、不渲染组件。
 这不是疏漏而是取舍：为了测一个组件而引入整套 DOM 环境，成本高于把逻辑抽出来。

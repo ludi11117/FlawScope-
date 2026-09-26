@@ -10,7 +10,7 @@
  */
 
 import type { NodeId, NodeState } from '../state/machine'
-import { NODES, computeNodeStates } from '../state/machine'
+import { NODES, PRIMARY_NODES, computeNodeStates } from '../state/machine'
 
 interface Props {
   visited: Set<NodeId>
@@ -31,8 +31,11 @@ const STATE_STYLE: Record<
 export function StateMachineView({ visited, active, debateRound, running }: Props) {
   const states = computeNodeStates(visited, active)
   const debateEntered = visited.has('review') || active === 'review'
-  const doneCount = NODES.filter((n) => states.get(n.id) === 'done').length
-  const pct = Math.round((doneCount / NODES.length) * 100)
+  // 进度分母用 PRIMARY_NODES（正常链路的 9 个节点），不含"转人工"。
+  // 转人工是条件分支：算进分母会让正常走完的一次诊断停在 9/10，
+  // 看起来像"没跑完"，而它其实已经完整结束了。
+  const doneCount = PRIMARY_NODES.filter((n) => states.get(n.id) === 'done').length
+  const pct = Math.round((doneCount / PRIMARY_NODES.length) * 100)
 
   return (
     <div
@@ -70,7 +73,7 @@ export function StateMachineView({ visited, active, debateRound, running }: Prop
           />
           诊断过程
           <span style={{ fontSize: 11.5, fontWeight: 400, color: 'var(--color-text-tertiary)' }}>
-            {doneCount}/{NODES.length}
+            {doneCount}/{PRIMARY_NODES.length}
           </span>
         </span>
         <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

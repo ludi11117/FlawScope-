@@ -36,6 +36,13 @@ export function HistoryPage() {
   const [error, setError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<number | null>(null)
   const debounceRef = useRef<number | null>(null)
+  // 在途请求的取消器。翻页/改筛选会立刻发新请求，旧请求如果不取消，
+  // 它**先回来**时会把新结果覆盖掉（网络快慢不由我们决定）——
+  // 表现是"点了下一页，列表闪一下又跳回上一页的内容"。
+  const abortRef = useRef<AbortController | null>(null)
+  // 请求序号兜底：abort 是"尽力而为"的（请求可能已经在返程路上），
+  // 序号则能确定性地丢弃过期响应。
+  const seqRef = useRef(0)
 
   // 搜索防抖：每敲一个字就打一次后端，既浪费也会让输入感觉卡顿
   useEffect(() => {
@@ -49,26 +56,53 @@ export function HistoryPage() {
     }
   }, [keywordInput])
 
+  const total = data?.total ?? 0
+  const records = data?.records ?? []
+  const win = useMemo(() => pageWindow(total, page, pageSize), [total, page, pageSize])
+
+  // `win` 的实时副本：`load` 需要读夹取后的 offset，但不能把 `win` 放进它的依赖数组
+  // ——`win` 依赖 `data.total`，而 `load` 会 setData，依赖成环后每次响应都会
+  // 触发新一轮请求（无限循环）。用 ref 读最新值既拿到 offset，又断开这条环。
+  const winRef = useRef(win)
+  winRef.current = win
+
   const load = useCallback(async () => {
+    abortRef.current?.abort()
+    const controller = new AbortController()
+    abortRef.current = controller
+    const seq = ++seqRef.current
+
     setLoading(true)
     setError(null)
     try {
-      const resp = await listRecords({ keyword, status, limit: pageSize, offset: (page - 1) * pageSize })
+      const resp = await listRecords(
+        {
+          keyword,
+          status,
+          limit: pageSize,
+          // 用**夹取后**的 offset，而不是 (page-1)*pageSize。
+          // 页码越界时（例如删掉了本页最后一条）前者一次就取到正确的页，
+          // 后者会先发一个注定为空的请求、再靠下面的 effect 纠正后重发。
+          offset: winRef.current.offset,
+        },
+        controller.signal,
+      )
+      if (seq !== seqRef.current) return // 过期响应，丢弃
       setData(resp)
     } catch (e) {
+      if ((e as Error).name === 'AbortError') return
+      if (seq !== seqRef.current) return
       setError(e instanceof ApiError ? e.message : `加载失败：${(e as Error).message}`)
     } finally {
-      setLoading(false)
+      if (seq === seqRef.current) setLoading(false)
     }
   }, [keyword, status, pageSize, page])
 
   useEffect(() => {
     void load()
+    // 卸载时中断在途请求：否则切页后还会继续打后端（与 SSE 那条是同一类问题）
+    return () => abortRef.current?.abort()
   }, [load])
-
-  const total = data?.total ?? 0
-  const records = data?.records ?? []
-  const win = useMemo(() => pageWindow(total, page, pageSize), [total, page, pageSize])
 
   // 后端返回的 total 可能让当前页码越界（例如删掉了本页最后一条），
   // 检测到就夹回去——不夹的话用户会停在空列表上，误以为"没有记录"。
@@ -424,6 +458,19 @@ function RecordRow({
     >
       <div
         onClick={onToggle}
+        // 可访问性：这一行是"可点击的展开开关"，但它是个 div。
+        // 没有 role/tabIndex 时，键盘用户 Tab 不到它、读屏软件也不会说它能点 ——
+        // 表格的详情对这部分用户等于不存在。
+        role="button"
+        tabIndex={0}
+        aria-expanded={isOpen}
+        onKeyDown={(e) => {
+          // 只认 Enter / Space（原生按钮的行为），不吞掉方向键与 Tab
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            onToggle()
+          }
+        }}
         style={{
           display: 'flex',
           alignItems: 'center',
