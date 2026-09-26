@@ -764,6 +764,13 @@ def test_tracked_records_node_duration():
 # ========== 排除映射缓存：辩论阶段不该对同一份输入重复调用 ==========
 
 def test_map_excluded_causes_caches_identical_inputs(monkeypatch):
+    """同一份输入第二次调用必须命中缓存，不再调模型。
+
+    ⚠️ 排除条件刻意选了一条**确定性通道匹配不到**的（"润滑油已更换"与两条条目
+    都没有共同 token）。B5 之后 `map_excluded_causes` 是"先确定性、只有漏网项
+    才叫 LLM"——若输入能被确定性命中，LLM 根本不会被调用，
+    这条测试就变成 `calls["n"] == 0`，测不到缓存（第一版就是这样，被全量回归抓到）。
+    """
     calls = {"n": 0}
 
     def fake_invoke(messages, llm=None, correlation_id=None):
@@ -775,8 +782,8 @@ def test_map_excluded_causes_caches_identical_inputs(monkeypatch):
 
     entries = [("主轴电机", "轴承损坏"), ("主轴电机", "负载过大")]
     try:
-        first = agents_module.map_excluded_causes(["轴承没问题"], entries, [0, 1])
-        second = agents_module.map_excluded_causes(["轴承没问题"], entries, [0, 1])
+        first = agents_module.map_excluded_causes(["润滑油已更换"], entries, [0, 1])
+        second = agents_module.map_excluded_causes(["润滑油已更换"], entries, [0, 1])
         assert first == second == [0]
         assert calls["n"] == 1                 # 第二次命中缓存，没有再调模型
     finally:

@@ -114,7 +114,22 @@ def main():
         print("先下载：curl -sL -o data/raw/siemens_DA_1106_cs.pdf <西门子官方附件地址>")
         sys.exit(1)
 
-    import pypdf
+    # pypdf 只给开发用（见 requirements.txt 的"开发/测试"段），容器镜像里没有它。
+    # 所以这里**不能裸 import**：真缺的时候要给出"怎么装"，而不是一个
+    # ModuleNotFoundError traceback —— 那个脚本的使用者往往是来验证数据管道的，
+    # 不是来排查 Python 依赖的。
+    try:
+        import pypdf
+    except ModuleNotFoundError:
+        print("缺少 pypdf（PDF 抽取用，只给开发环境装）。")
+        print()
+        print("  安装：  venv\\Scripts\\python.exe -m pip install -r requirements.txt")
+        print("  或单独：venv\\Scripts\\python.exe -m pip install pypdf")
+        print()
+        print("  说明：容器镜像（requirements-runtime.txt）**不含** pypdf，")
+        print("        这个脚本是「把厂家手册变成知识库」的管道验证工具，运行期用不到。")
+        sys.exit(1)
+
     reader = pypdf.PdfReader(str(PDF))
     print(f"手册：{PDF.name}  共 {len(reader.pages)} 页")
 

@@ -21,6 +21,7 @@ BM25 索引都还没加载，此时发起诊断必然失败。前端顶栏状态
 import pytest
 from fastapi.testclient import TestClient
 
+import agents as agents_module
 import api
 import startup_status
 
@@ -246,7 +247,12 @@ def test_lifespan_reports_steps_and_marks_ready(monkeypatch):
     """
     steps_seen: list[str] = []
 
-    # 把六个初始化步骤全换成桩：单测不能真去加载向量库
+    # 把初始化步骤全换成桩：单测不能真去加载向量库。
+    # 注意「构建检索索引」（B3 新增）用的是**真实** `agents._init_bm25`：
+    # 它内部会调 `agents.get_db()`，而 conftest 的 autouse 夹具已把
+    # CHROMA_PERSIST_DIR 指到 tmp_path，落到一个空库上 —— 于是走"空库短路"
+    # 分支，不做任何分词，同时把 `_bm25_initialized` 置真。
+    # 这正是我们要测的：**接线是真的**，而不只是"步骤列表里有个名字"。
     monkeypatch.setattr(api, "configure_logging", lambda: None)
     monkeypatch.setattr(api, "init_db", lambda: None)
     monkeypatch.setattr(api, "get_llm", lambda: None)
@@ -267,9 +273,19 @@ def test_lifespan_reports_steps_and_marks_ready(monkeypatch):
         # 进入 with 即跑完 lifespan 的启动段
         assert startup_status.snapshot()["ready"] is True
 
-    assert len(steps_seen) == 6
+    # 步骤数随 B3 新增的「构建检索索引」由 6 变 7 —— 断言语义未变：
+    # 仍然要求"上报的步骤数 == 实际执行的步骤数"，多一步少一步都会红。
+    assert len(steps_seen) == 7
     assert "加载向量库" in steps_seen
     assert "校验知识库" in steps_seen
+    # B3 的判别式：检索索引必须在启动期就建好。
+    # 只断言"步骤列表里有这个名字"是不够的 —— 名字可以加进去而函数不接上；
+    # 这里直接查 agents 模块的真实状态位。
+    assert "构建检索索引" in steps_seen
+    assert agents_module._bm25_initialized is True, (
+        "lifespan 走完后 BM25 仍未初始化 —— 首次检索还得现场建索引，"
+        "/health/ready 宣告的就绪是假的"
+    )
     # 库非空时不该产生警告——否则"知识库为空"的提示会天天挂在界面上，
     # 用户很快就学会忽略它。
     assert startup_status.snapshot()["warnings"] == []
