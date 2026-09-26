@@ -1,0 +1,42 @@
+# FlawScope 运行期依赖（base）。
+#
+# 由 `requirements-runtime.txt`（容器镜像）与 `requirements-dev.txt`（开发/测试）
+# 共同通过 `-r requirements-base.txt` 组合引用 —— **不要在这里放开发依赖**。
+#
+# 为什么拆开：此前 `requirements.txt` 与 `requirements-runtime.txt` 是**手抄**的两份，
+# 前面几十行逐字重复。手抄的代价不是多打几个字，而是**漂移**：只在一个文件里升了版本，
+# 于是"本地测过的"和"镜像里跑的"变成两个东西，而所有测试都发现不了——
+# 镜像用的那份清单从来没被测试验证过。用 `-r` 之后版本只有这一份需要维护。
+#
+# 不使用本地 torch / transformers：嵌入与推理均走在线 API，镜像更小。
+# 详见 requirements-dev.txt 里关于 torch 的说明（那段背景注释随 dev 清单保留）。
+
+# ===== LLM / Agent 编排 =====
+langchain-openai==1.5.1
+langchain-core==1.5.5
+langchain-chroma==1.1.0
+langchain-text-splitters==1.1.2
+langgraph==1.2.11
+openai==3.1.0
+tiktoken==0.13.0
+
+# ===== 向量检索 =====
+chromadb==1.5.9
+rank-bm25==0.2.2
+
+# ===== 配置 / 日志 / 可靠性 =====
+pydantic==2.13.4
+pydantic-settings==2.15.0
+python-dotenv==1.2.2
+structlog==26.1.0
+tenacity==9.1.4
+jinja2==3.1.6
+
+# ===== 中文 NLP =====
+jieba==0.42.1
+
+# ===== Web =====
+fastapi==0.141.1
+uvicorn==0.52.4
+python-multipart==0.0.32
+httpx==0.28.1

@@ -1,0 +1,57 @@
+# FlawScope 开发 / 测试依赖（在 base 之上追加）。
+#
+# 用法：
+#     pip install -r requirements-dev.txt      # 本地开发 / 跑测试
+#     pip install -r requirements-runtime.txt  # 容器镜像（只装 base）
+#
+# 拆分结构：
+#     requirements-base.txt      ← 版本唯一来源
+#     requirements-dev.txt       ← 本文件（-r base + dev）
+#     requirements-runtime.txt   ← -r base
+#     requirements.txt           ← -r dev（保留旧文件名，兼容既有脚本与文档）
+
+-r requirements-base.txt
+
+# ===== 开发 / 测试 =====
+pytest==9.1.1
+# PDF 抽取（tools/parse_manual_pdf.py）。**只给开发用**：
+# 容器镜像不装它（requirements-runtime.txt 只引 base），因为那个脚本是"把厂家手册
+# 变成知识库"的管道验证工具，运行期用不到。
+# 此前它靠传递依赖碰巧装上了——`import pypdf` 写在函数体里、又没有任何清单声明，
+# 换台机器就会在跑脚本时才炸。显式声明是唯一能让它"装得对"的办法。
+pypdf==6.19.0
+
+# ===== 旧前端（app.py，仅作对照，容器不装）=====
+# Streamlit 前端已收口为**对照实现**，日常入口是 web/ 的 React 前端，
+# 容器入口只起 FastAPI（见 entrypoint.sh）。需要本地起它做对照时装这两个。
+streamlit==1.62.0
+pandas==3.0.5
+
+# =============================================================================
+# ⚠️ 不要安装 torch / torchvision / sentence-transformers（本项目不需要）
+# -----------------------------------------------------------------------------
+# 本项目**不用本地推理**：推理走 SiliconFlow 在线 API，嵌入走在线 Embedding API，
+# 向量检索用 ChromaDB + BM25。所以本地既不需要 torch，也不需要 sentence-transformers。
+#
+# 但装了它们会**无声地拖慢启动**，原因是传递依赖：
+#   langchain_core/language_models/base.py 顶层无条件执行
+#       from transformers import GPT2TokenizerFast
+#   → transformers/__init__.py 导入 modeling_gguf_pytorch_utils
+#   → 该模块检测到 torch 可用就 `import torch`
+# 于是 import 链里凭空多出 torch（约 2.5s）+ torchvision，冷启动从 ~6s 涨到 ~9s。
+#
+# 实测（本机，import api 耗时中位数）：装了 torch 约 9.3s，卸掉后约 5.7s。
+# 影响的不只是启动：pytest 全量从 ~59s 降到 ~21s。
+#
+# transformers 本身**保留**（它不依赖 torch 的部分仍在被 langchain_core 用于
+# token 估算，且 fast tokenizer 走 tokenizers 库，不需要 torch）。
+#
+# 自查：python -c "import importlib.util as u; print(u.find_spec('torch'))"
+#       打印 None 即为正常；非 None 说明有包把它带进来了。
+# 恢复（若确需本地推理）：pip install torch torchvision
+
+# 已移除（不要再加回来）：
+#   requests      —— 只有 legacy/test_api.py 用，而 legacy/ 已冻结、
+#                    既不参与 lint 也不进镜像；为它拖一个运行期依赖不划算。
+#   pytest-asyncio —— 全仓零 async 测试（grep `async def test` / `pytest.mark.asyncio`
+#                    无命中），装了只是占位置。

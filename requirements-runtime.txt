@@ -1,36 +1,11 @@
-# Docker 运行时依赖：在 requirements.txt 基础上再去掉开发/测试依赖，
-# 以及只服务于旧前端（app.py）的 streamlit / pandas。
+# Docker 运行时依赖 = base（只装运行期真正会 import 的东西）。
+#
+# 与 `requirements.txt` 的关系：那份是 `-r requirements-base.txt`（= base + 开发依赖），
+# 这份只 `-r requirements-base.txt`，因此不装 pytest / pypdf / streamlit / pandas。
+#
+# ⚠️ 改 Dockerfile 时注意：`-r` 引用的文件必须一起 COPY 进镜像，
+# 否则 `pip install -r requirements-runtime.txt` 会因找不到 base 而失败。
+#
 # 不使用本地 torch / transformers：嵌入与推理均走在线 API，镜像更小。
 
-# ===== LLM / Agent 编排 =====
-langchain-openai==1.5.1
-langchain-core==1.5.5
-langchain-chroma==1.1.0
-langchain-text-splitters==1.1.2
-langgraph==1.2.11
-openai==3.1.0
-tiktoken==0.13.0
-
-# ===== 向量检索 =====
-chromadb==1.5.9
-rank-bm25==0.2.2
-
-# ===== 配置 / 日志 / 可靠性 =====
-pydantic==2.13.4
-pydantic-settings==2.15.0
-python-dotenv==1.2.2
-structlog==26.1.0
-tenacity==9.1.4
-jinja2==3.1.6
-
-# ===== 中文 NLP =====
-jieba==0.42.1
-
-# ===== Web / 前端 =====
-# 注意：这里**不装** streamlit 与 pandas。
-# 它们只被 app.py（Streamlit 旧前端）使用，而容器入口只起 FastAPI（见 entrypoint.sh）。
-# 旧前端仍保留在仓库里供对照，需要跑它时用 requirements.txt 本地起。
-fastapi==0.141.1
-uvicorn==0.52.4
-python-multipart==0.0.32
-httpx==0.28.1
+-r requirements-base.txt
