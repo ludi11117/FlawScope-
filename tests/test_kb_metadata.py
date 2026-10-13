@@ -1,11 +1,11 @@
-"""知识库 metadata 与检索过滤开关（C2 —— 只做了"无行为变化"的半步）。
+"""知识库 metadata、设备来源标注与检索过滤开关。
 
 ## 做了什么
 
 1. **入库时写 metadata**：`build_knowledge_base.parse_chunk_metadata()` 给每个块
    补上 `{section, chapter, alarm, device}`，由 `db.add_texts(chunks, metadatas=...)`
-   写入。**切分本身一个字都没动**（按位置回溯，块边界与以前逐字节相同），
-   所以对现有检索行为零影响。
+   写入。**切分本身一个字都没动**（按位置回溯，块边界与以前逐字节相同）。
+   检索结果会使用 metadata 标明设备来源，让缺少章节标题的正文块能通过设备护栏。
 2. **检索过滤的开关**：`settings.RETRIEVAL_DEVICE_FILTER` + `agents.device_filter()`。
    **默认关闭**，`retrieve_evidence(..., device=...)` 只有在开关打开时才会把
    `filter={"device": ...}` 传给 Chroma。
@@ -13,9 +13,8 @@
 ## 没做什么（待决策）
 
 按交办书 §5.2 的要求，"是否默认开启过滤"牵动误降级指标，先不动。
-另外：**现有 `chroma_db/` 是没写 metadata 的旧库**，而重建向量库要真调 Embedding
-（花钱），所以这套 metadata 要等下一次真实重建才会生效。在那之前开启过滤 =
-召回为空 = 全线误降级。测试里用假 Chroma 只验证"开关接线正确"，不碰真实库。
+旧版 `chroma_db/` 可能没有 metadata；这时设备来源标注退化为原样文本。
+开启设备过滤前仍须确认向量库已重建，否则可能召回为空并误降级。
 
 全部离线：不联网、不碰真实 `chroma_db/`。
 """
@@ -181,6 +180,33 @@ def _wire(monkeypatch, fake):
     monkeypatch.setattr(agents, "get_db", lambda: fake)
     monkeypatch.setattr(agents, "_bm25_initialized", False)
     agents._retrieval_cache.clear()
+
+
+def test_retrieved_chunk_carries_device_source_for_guard(monkeypatch):
+    """条目块没有章节标题时，也应使用入库 metadata 识别设备。"""
+    class FakeChroma:
+        def get(self):
+            return {
+                "documents": ["二、主轴电机报警代码E-101\n1. 电机电源输入异常"],
+                "metadatas": [{"device": "数控机床主轴电机"}],
+            }
+
+        def similarity_search(self, query, k, **kwargs):
+            class Document:
+                page_content = "二、主轴电机报警代码E-101\n1. 电机电源输入异常"
+
+            return [Document()]
+
+    _wire(monkeypatch, FakeChroma())
+    evidence = agents.retrieve_evidence("主轴电机 E-101", k=1)
+
+    assert "【设备来源：数控机床主轴电机】" in evidence
+    assert agents.is_equipment_in_evidence(
+        {"设备类型": "数控机床", "报警代码": "E-101"}, evidence
+    )
+    assert not agents.is_equipment_in_evidence(
+        {"设备类型": "注塑机", "报警代码": "E-101"}, evidence
+    )
 
 
 def test_retrieval_does_not_filter_by_default(monkeypatch):

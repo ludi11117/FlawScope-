@@ -62,6 +62,7 @@ _singleton_lock = threading.RLock()
 _bm25_index = None
 _bm25_corpus = None
 _doc_texts_cache = None
+_doc_device_labels = {}
 _bm25_initialized = False
 # 构建索引要遍历整个知识库做 jieba 分词，代价很高；Streamlit 多会话 + FastAPI
 # 线程池会并发进来，必须加锁做双重检查，否则同一份索引会被反复重建。
@@ -531,7 +532,7 @@ def invoke_and_validate(
 
 def _init_bm25():
     """初始化 BM25 索引（仅首次调用时执行，加锁避免并发重复构建）"""
-    global _bm25_index, _bm25_corpus, _doc_texts_cache, _bm25_initialized
+    global _bm25_index, _bm25_corpus, _doc_texts_cache, _doc_device_labels, _bm25_initialized
 
     if _bm25_initialized:
         return
@@ -545,6 +546,16 @@ def _init_bm25():
         db = get_db()
         all_docs = db.get() or {}
         _doc_texts_cache = all_docs.get("documents") or []
+        # 切块可能把章节标题留在上一块。把入库时保存的设备来源随证据
+        # 一起交给护栏，避免「E-101 明明命中，却因块内没有机床二字」误降级。
+        # 同一段文本若对应多个设备，则不标注，防止来源歧义被误用。
+        labels = {}
+        for doc, meta in zip(_doc_texts_cache, all_docs.get("metadatas") or []):
+            if meta and meta.get("device"):
+                labels.setdefault(doc, set()).add(meta["device"])
+        _doc_device_labels = {
+            doc: next(iter(devices)) for doc, devices in labels.items() if len(devices) == 1
+        }
 
         if not _doc_texts_cache:
             # 知识库为空（首次克隆后尚未执行 build_knowledge_base.py）。
@@ -771,7 +782,12 @@ def retrieve_evidence(fault_description: str, k: int = None, correlation_id: str
         logger.info("retrieve_no_results", query=fault_description[:50], correlation_id=correlation_id)
         result = "【知识库无相关依据】"
     else:
-        result = "\n\n".join([f"【资料{i}】\n{text}" for i, text in enumerate(combined, 1)])
+        result = "\n\n".join(
+            f"【资料{i}】\n"
+            + (f"【设备来源：{_doc_device_labels[text]}】\n" if text in _doc_device_labels else "")
+            + text
+            for i, text in enumerate(combined, 1)
+        )
         logger.info(
             "retrieve_done",
             bm25_hits=len(bm25_texts),
