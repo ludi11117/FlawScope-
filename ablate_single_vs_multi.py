@@ -11,7 +11,8 @@
   1. 用 `eval_test` 的**同一个** `judge_root_cause` / `is_hallucinated` /
      `check_exclusion` / `is_unknown_response` 判两边的输出；
   2. 单 Agent 只做「抽取 → 检索 → 一次诊断」，**不给审核、不给辩论、不给 schema 回灌**；
-  3. 两侧用同一次检索得到的**同一份 evidence**（否则幻觉率差异可能只是检索差异）；
+  3. 两侧共用多 Agent 的**初始检索证据**；复议后的重新检索是多 Agent 自身的能力，
+     不能提前泄漏给单 Agent；
   4. 结果落盘 JSON + Markdown，含逐用例对照表，便于人工复核。
 
 诚实性约束（写死在代码里，防止我自己事后粉饰）：
@@ -78,8 +79,7 @@ def single_agent_run(fault_text: str, evidence: str = None) -> dict:
     刻意**不**复用 orchestrator 的任何节点，否则就变成"多 Agent 减去一点"
     而不是真正的单 Agent 基线。
 
-    evidence 传入时直接复用（保证两侧面对同一份资料，幻觉率差异才归因于生成
-    而非检索）；为 None 时自行检索。
+    evidence 传入时复用多 Agent 的初始检索资料；为 None 时自行检索。
     """
     fault_info = extract_fault_info(fault_text)
     if fault_info is None:
@@ -114,6 +114,7 @@ def multi_agent_run(fault_text: str) -> dict:
         "initial_root": initial,
         "root": final,
         "evidence": result.get("evidence") or "",
+        "initial_evidence": result.get("initial_evidence") or "",
         "rounds": int(result.get("debate_round", 0) or 0),
         "missing_nodes": eval_test._missing_nodes(result),
         "token_usage": result.get("token_usage", {}),
@@ -254,7 +255,7 @@ def build_markdown(meta: dict, single: dict, multi: dict, records: list,
     L.append(f"- 知识库规模：{meta['kb_chars']} 字符 / {meta['kb_lines']} 行")
     L.append("")
     L.append("## 口径说明（可比性前提）\n")
-    L.append("两侧使用 test/eval 的**同一套**判定函数；单 Agent 与多 Agent 共用同一次检索的 evidence。")
+    L.append("两侧使用 test/eval 的**同一套**判定函数，且共用初始检索证据；多 Agent 复议时的重新检索只供其自身使用。")
     L.append("单 Agent 调用失败计为失败，不从分母剔除。")
     L.append("")
     L.append("⚠️ **「全覆盖率」有两个口径，必须一起看。** 默认口径的分母是「判官实际判过的用例」")
@@ -333,9 +334,9 @@ def run_once(cases: list, args) -> list:
         tag = "（知识库外）" if case.get("expect_unknown") else ("（排除条件）" if case.get("excluded_keywords") else "")
         print(f"\n[{i}/{len(cases)}] {case['id']}{tag}")
 
-        # 先跑多 Agent（它会做检索），单 Agent 复用同一份 evidence 保证可比
+        # 单 Agent 只拿初始证据；若多 Agent 复议重检索，不能把后来的资料泄漏给基线。
         multi_raw = multi_agent_run(case["fault_description"])
-        single_raw = single_agent_run(case["fault_description"], multi_raw.get("evidence", ""))
+        single_raw = single_agent_run(case["fault_description"], multi_raw["initial_evidence"])
 
         single_scored = score_one(single_raw["root"], single_raw["evidence"], case, args)
         single_scored["ok"] = single_raw["ok"]
@@ -387,7 +388,7 @@ def main():
     print("=" * 88)
     print("消融实验：单 Agent（抽取→检索→一次诊断） vs 多 Agent（审核+辩论+复审）")
     print(f"用例 {len(cases)} 条 | 判官 {args.judge_model}{'（跳过）' if args.skip_judge else ''}")
-    print("两侧共用同一次检索的 evidence，判定函数完全一致。")
+    print("两侧共用初始检索证据；复议重新检索只供多 Agent 使用，判定函数完全一致。")
     print("=" * 88)
 
     t_start = time.perf_counter()
