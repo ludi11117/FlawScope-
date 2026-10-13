@@ -96,7 +96,7 @@ python orchestrator.py               # 命令行直接跑一次诊断
 **只跑测试不需要密钥**（`tests/conftest.py` 会兜底塞一个假 key）：
 
 ```bash
-venv/Scripts/python.exe -m pytest -q        # 563 项，全离线，约 9 秒
+venv/Scripts/python.exe -m pytest -q        # 565 项，全离线，约 9 秒
 ```
 
 ---
@@ -119,7 +119,7 @@ FlawScope/
 ├── eval_test.py                 自动化评估（LLM 判官 + 程序化指标），会真实花钱
 ├── compare_single_vs_multi.py   单 Agent vs 多 Agent 对比实验
 ├── test_cases.json              评估用例集（含对抗案例）
-├── tests/                       563 项离线单测
+├── tests/                       565 项离线单测
 ├── data/knowledge_base.txt      原始知识库（示例级数据）
 ├── chroma_db/                   向量库持久化目录（gitignored）
 ├── diagnosis_history.db         诊断历史（gitignored）
@@ -730,7 +730,7 @@ find . -maxdepth 2 -type f -newermt '-90 seconds' \
 
 ```bash
 # 测试与检查
-venv/Scripts/python.exe -m pytest -q          # 563 项离线单测
+venv/Scripts/python.exe -m pytest -q          # 565 项离线单测
 ruff check .                                   # 静态检查
 ruff check . --statistics                      # 看各类问题数量
 
